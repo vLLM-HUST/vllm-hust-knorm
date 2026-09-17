@@ -104,15 +104,20 @@ def get_knorm_manager_class() -> type:
             )
 
         def remove_skipped_blocks(
-            self, request_id: str, total_computed_tokens: int
+            self,
+            request_id: str,
+            total_computed_tokens: int,
+            num_prompt_tokens: int | None = None,
         ) -> None:
             """Remove the least important blocks from the prefix.
 
-            Drains the global score buffer, plans the eviction with the
-            pure planner, then applies it to the live block table:
-            evicted positions become the null block; cached blocks are
-            freed at the tail of the free queue (LRU), uncached blocks
-            at the head (immediate reuse).
+            Signature tracks the verified host (0.23-seam-era) which passes
+            ``num_prompt_tokens`` (R-SWA middle-gap semantics; ignored by
+            head-prefix eviction). Drains the global score buffer, plans
+            the eviction with the pure planner, then applies it to the
+            live block table: evicted positions become the null block;
+            cached blocks are freed at the tail of the free queue (LRU),
+            uncached blocks at the head (immediate reuse).
             """
             # ── 1. Drain and ingest pending scores ──
             scores = drain_block_scores()
