@@ -88,9 +88,52 @@ def _warn_prefix_caching_blocks_knorm() -> None:
         logger.warning(message)
 
 
+def _resolve_free_queue_cls(kv_cache_utils_module: Any) -> type:
+    """Resolve the host free-block queue class across host generations.
+
+    Current hosts name it ``FreeKVCacheBlockQueue``; 0.23-seam-era
+    hosts named it ``FreeQueue``. Missing both is a contract breach.
+    """
+    for name in ("FreeKVCacheBlockQueue", "FreeQueue"):
+        cls = getattr(kv_cache_utils_module, name, None)
+        if cls is not None:
+            return cls
+    raise RuntimeError(
+        "vllm-hust-knorm: host provides neither FreeKVCacheBlockQueue "
+        "nor FreeQueue in vllm.v1.core.kv_cache_utils; refusing to "
+        "patch (see HOST_CONTRACT.md)"
+    )
+
+
+def _queue_prepend_method(queue: Any) -> Callable[[list], None]:
+    """The queue's head-insertion method, whatever the host calls it.
+
+    Current hosts ship a native ``prepend_n``; the plugin-added
+    ``prependleft_n`` covers 0.23-era queues that lack both.
+    """
+    for name in ("prepend_n", "prependleft_n"):
+        method = getattr(queue, name, None)
+        if method is not None:
+            return method
+    raise RuntimeError(
+        "vllm-hust-knorm: free-block queue has no head-insertion "
+        "method (prepend_n/prependleft_n); refusing to free with "
+        "prepend"
+    )
+
+
 def _install_free_queue_prepend(free_queue_cls: type) -> bool:
-    """P1: add ``prependleft_n`` (identical to the in-tree addition)."""
-    if getattr(free_queue_cls, "prependleft_n", None) is not None:
+    """P1: ensure the queue supports head insertion (idempotent).
+
+    Hosts with a native ``prepend_n`` (current main) or
+    ``prependleft_n`` (0.23 seam era) need nothing; older shapes get
+    the in-tree ``prependleft_n`` implementation added (legacy PR #76).
+    """
+    has_native = any(
+        callable(getattr(free_queue_cls, name, None))
+        for name in ("prepend_n", "prependleft_n")
+    )
+    if has_native:
         return False
 
     def prependleft_n(self: Any, blocks: list[Any]) -> None:
@@ -154,7 +197,7 @@ def _install_free_blocks_prepend(block_pool_cls: type) -> bool:
             block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
         if freed:
-            self.free_block_queue.prependleft_n(freed)
+            _queue_prepend_method(self.free_block_queue)(freed)
 
     setattr(free_blocks, _PATCHED, True)
     block_pool_cls.free_blocks = free_blocks
@@ -328,10 +371,9 @@ def install_patches() -> dict[str, Any]:
     import vllm.v1.kv_cache_spec_registry as registry_module
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+    free_queue_cls = _resolve_free_queue_cls(kv_cache_utils_module)
     applied = {
-        "free_queue_prependleft_n": _install_free_queue_prepend(
-            kv_cache_utils_module.FreeQueue
-        ),
+        "free_queue_head_insertion": _install_free_queue_prepend(free_queue_cls),
         "block_pool_free_blocks_prepend": _install_free_blocks_prepend(
             block_pool_module.BlockPool
         ),

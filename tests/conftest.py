@@ -132,14 +132,19 @@ def build_fake_host() -> dict[str, Any]:
     registry_module._REGISTRY_KVCACHESPEC_LIST = KVCacheSpecRegistry._REGISTRY
     host["registry"] = KVCacheSpecRegistry
 
-    # --- vllm.v1.core.kv_cache_utils / FreeQueue -----------------------
+    # --- vllm.v1.core.kv_cache_utils / free-block queue ----------------
+    # Mirrors the real host: FreeKVCacheBlockQueue with a native
+    # prepend_n (current vllm-hust main). The 0.23-seam era named it
+    # FreeQueue and lacked head insertion — the legacy variant is
+    # exposed for the fallback test via make_legacy_queue().
     kcu = register_module("vllm.v1.core.kv_cache_utils")
 
-    class FreeQueue:
+    class FreeKVCacheBlockQueue:
         def __init__(self):
             self.fake_free_list_head = types.SimpleNamespace(next_free_block=None)
             self.num_free_blocks = 0
             self.blocks: list = []
+            self.prepend_calls: list[list] = []
 
         def append_n(self, blocks):
             for i in range(len(blocks) - 1):
@@ -154,15 +159,48 @@ def build_fake_host() -> dict[str, Any]:
                 self.blocks.extend(blocks)
             self.num_free_blocks += len(blocks)
 
-    kcu.FreeQueue = FreeQueue
-    host["FreeQueue"] = FreeQueue
+        def prepend_n(self, blocks):
+            self.prepend_calls.append(list(blocks))
+            if not blocks:
+                return
+            if self.fake_free_list_head.next_free_block is None:
+                self.append_n(blocks)
+                return
+            first, rest = blocks[0], blocks[1:]
+            for i in range(len(blocks) - 1):
+                blocks[i].next_free_block = blocks[i + 1]
+                blocks[i + 1].prev_free_block = blocks[i]
+            old_first = self.fake_free_list_head.next_free_block
+            self.fake_free_list_head.next_free_block = first
+            first.prev_free_block = self.fake_free_list_head
+            blocks[-1].next_free_block = old_first
+            old_first.prev_free_block = blocks[-1]
+            self.num_free_blocks += len(blocks)
+            self.blocks.extend(rest or [])
+
+    def make_legacy_queue():
+        """0.23-seam-era FreeQueue: no head insertion at all."""
+
+        class FreeQueue:
+            def __init__(self):
+                self.fake_free_list_head = types.SimpleNamespace(next_free_block=None)
+                self.num_free_blocks = 0
+                self.blocks: list = []
+
+            append_n = FreeKVCacheBlockQueue.append_n
+
+        return FreeQueue
+
+    kcu.FreeKVCacheBlockQueue = FreeKVCacheBlockQueue
+    host["FreeKVCacheBlockQueue"] = FreeKVCacheBlockQueue
+    host["make_legacy_queue"] = make_legacy_queue
 
     # --- vllm.v1.core.block_pool ---------------------------------------
     bp = register_module("vllm.v1.core.block_pool")
 
     class BlockPool:
         def __init__(self):
-            self.free_block_queue = FreeQueue()
+            self.free_block_queue = FreeKVCacheBlockQueue()
             self.null_block = types.SimpleNamespace(is_null=True, ref_cnt=99)
             self.freed: list[list] = []
 

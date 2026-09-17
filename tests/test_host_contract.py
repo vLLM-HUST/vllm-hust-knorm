@@ -32,7 +32,18 @@ class TestInstallIdempotency:
     def test_install_reports_all_patches(self, fake_host):
         info = install_patches()
         assert info["already_installed"] is False
-        assert all(info["patches"].values())
+        # The fake host mirrors vllm-hust main: the free-block queue
+        # ships a native prepend_n, so P1 correctly reports "nothing to
+        # add"; every wrap-based patch applies.
+        assert info["patches"]["free_queue_head_insertion"] is False
+        for key in (
+            "block_pool_free_blocks_prepend",
+            "spec_registration",
+            "scheduler_score_routing",
+            "runner_init",
+            "runner_sample_tokens",
+        ):
+            assert info["patches"][key] is True, key
 
     def test_second_install_is_noop(self, fake_host):
         install_patches()
@@ -41,9 +52,33 @@ class TestInstallIdempotency:
 
 
 class TestQueueAndFreeBlocks:
-    def test_prependleft_n_inserts_at_head(self, fake_host):
+    def test_native_prepend_n_is_used_on_current_hosts(self, fake_host):
         install_patches()
-        queue = fake_host["FreeQueue"]()
+        queue = fake_host["FreeKVCacheBlockQueue"]()
+
+        def block():
+            return types.SimpleNamespace(next_free_block=None, prev_free_block=None)
+
+        first, second = block(), block()
+        queue.append_n([first])
+        queue.prepend_n([second])
+
+        assert queue.fake_free_list_head.next_free_block is second
+        assert second.next_free_block is first
+        assert queue.num_free_blocks == 2
+
+    def test_legacy_queue_gets_prependleft_n_added(self, fake_host):
+        # 0.23-seam-era FreeQueue without head insertion: P1 must add
+        # prependleft_n and P2 must route through it.
+        legacy_cls = fake_host["make_legacy_queue"]()
+        host_module("vllm.v1.core.kv_cache_utils").FreeKVCacheBlockQueue = None
+        host_module("vllm.v1.core.kv_cache_utils").FreeQueue = legacy_cls
+
+        info = install_patches()
+        assert info["patches"]["free_queue_head_insertion"] is True
+        assert hasattr(legacy_cls, "prependleft_n")
+
+        queue = legacy_cls()
 
         def block():
             return types.SimpleNamespace(next_free_block=None, prev_free_block=None)
@@ -65,7 +100,9 @@ class TestQueueAndFreeBlocks:
         pool.free_blocks([evicted], prepend=True)
         assert evicted.ref_cnt == 0
         assert pool.free_block_queue.num_free_blocks == 1
-        assert pool.free_block_queue.fake_free_list_head.next_free_block is (evicted)
+        # Routed through the host-native prepend_n.
+        assert pool.free_block_queue.prepend_calls == [[evicted]]
+        assert pool.free_block_queue.fake_free_list_head.next_free_block is evicted
 
         pool.free_blocks([cached])  # default path still delegates
         assert cached.ref_cnt == 0
