@@ -38,6 +38,26 @@ class TestBootstrap:
             bootstrap.register_plugins()
         del sys.modules["vllm.knorm"]
 
+    def test_stale_namespace_dir_is_not_an_in_tree_conflict(self, fake_host):
+        # Real-host regression (910B2 checkout): an emptied vllm/knorm/
+        # directory with only __pycache__ left resolves as a namespace
+        # package (loader=None) — that must NOT trip the conflict guard.
+        import importlib.machinery
+        import sys
+
+        namespace_spec = importlib.machinery.ModuleSpec("vllm.knorm", loader=None)
+        namespace_spec.submodule_search_locations = ["/nonexistent/vllm/knorm"]
+        stale = type(sys)("vllm.knorm")
+        stale.__spec__ = namespace_spec
+        sys.modules["vllm.knorm"] = stale
+
+        try:
+            result = bootstrap.register_plugins()
+        finally:
+            del sys.modules["vllm.knorm"]
+
+        assert result == ["knorm"]
+
     def test_fail_closed_on_missing_surface(self, fake_host):
         import sys
 

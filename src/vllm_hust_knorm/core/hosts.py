@@ -36,6 +36,21 @@ def module_importable(name: str) -> bool:
         return False
 
 
+def real_module_present(name: str) -> bool:
+    """Whether *name* resolves to a real module — not a bare namespace.
+
+    ``find_spec`` returns a loader-less spec for namespace packages, so
+    a stale directory such as an emptied ``vllm/knorm/`` (only
+    ``__pycache__`` left behind) must not be mistaken for an in-tree
+    module. Verified on the real 910B2 host checkout.
+    """
+    try:
+        spec = importlib.util.find_spec(name)
+    except (ImportError, ValueError):
+        return False
+    return spec is not None and spec.loader is not None
+
+
 def detect_host() -> str | None:
     """Detect the host stack in this interpreter, or ``None``."""
     if module_importable("vllm"):
@@ -49,9 +64,10 @@ def require_no_in_tree_knorm() -> None:
     vLLM-HUST builds of the 0.23 seam era embed the legacy in-tree Knorm
     module behind try-imports. Installing this plugin next to them would
     double-provide the feature; the guide forbids silently ignoring the
-    conflict, so activation refuses with instructions.
+    conflict, so activation refuses with instructions. A stale directory
+    without ``__init__.py`` (namespace-only) is not a conflict.
     """
-    if module_importable("vllm.knorm"):
+    if real_module_present("vllm.knorm"):
         raise RuntimeError(
             "vllm-hust-knorm refuses to activate: this vLLM install "
             "already ships an in-tree 'vllm.knorm' module. Remove the "
@@ -88,6 +104,7 @@ __all__ = [
     "VLLM_HOST",
     "detect_host",
     "module_importable",
+    "real_module_present",
     "require_host_surfaces",
     "require_no_in_tree_knorm",
 ]

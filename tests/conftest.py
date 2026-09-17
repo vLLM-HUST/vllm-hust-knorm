@@ -32,9 +32,15 @@ HOST_MODULE_PREFIXES = ("vllm",)
 
 
 def make_module(name: str) -> types.ModuleType:
-    """Create a fake module that ``importlib.util.find_spec`` resolves."""
+    """Create a fake module that ``importlib.util.find_spec`` resolves.
+
+    The spec carries a loader (like a real module); loader-less specs
+    mean namespace packages and are treated as "not present" by the
+    plugin's conflict guards (see ``real_module_present``).
+    """
     module = types.ModuleType(name)
-    module.__spec__ = importlib.machinery.ModuleSpec(name, loader=None)
+    loader = importlib.machinery.SourceFileLoader(name, f"/nonexistent/{name}.py")
+    module.__spec__ = importlib.machinery.ModuleSpec(name, loader=loader)
     module.__package__ = name
     return module
 
