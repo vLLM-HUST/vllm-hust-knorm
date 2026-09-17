@@ -1,0 +1,637 @@
+From b2316fe6356cb02152f0dd0c2097f7ebab88cc55 Mon Sep 17 00:00:00 2001
+From: kotoriqaq0 <2216804318@qq.com>
+Date: Fri, 19 Jun 2026 21:42:39 +0800
+Subject: [PATCH] feat: add knorm KV cache compression module
+
+New module vllm/knorm/: KnormConfig (env-based configuration),
+attention wrapper (key L2 norm computation on CUDA/Ascend),
+KnormFullAttentionManager (KV cache block eviction based on
+compression ratio), and runtime hooks (score collection and
+routing between model runner and scheduler).
+
+Integration into v1 core: scheduler routes block scores from
+ModelRunnerOutput to KV cache manager; single_type_kv_cache_manager
+registers KnormFullAttentionManager as default for FullAttentionSpec;
+gpu_model_runner installs attention wrapper and collects norms
+after each model forward.
+
+Knorm (Devoto et al., 2024) shows that KV cache blocks with high
+key L2 norms receive low attention scores during decoding, making
+them safe to evict. This module reduces KV cache memory usage with
+minimal quality loss, controlled via environment variables.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: kotoriqaq0 <2216804318@qq.com>
+---
+ vllm/knorm/__init__.py                       |  41 +++++
+ vllm/knorm/attention_backend.py              | 133 +++++++++++++++++
+ vllm/knorm/config.py                         |  49 ++++++
+ vllm/knorm/hooks.py                          |  89 +++++++++++
+ vllm/knorm/manager.py                        | 149 +++++++++++++++++++
+ vllm/v1/core/sched/scheduler.py              |   7 +
+ vllm/v1/core/single_type_kv_cache_manager.py |  18 +++
+ vllm/v1/worker/gpu_model_runner.py           |  23 +++
+ 8 files changed, 509 insertions(+)
+ create mode 100644 vllm/knorm/__init__.py
+ create mode 100644 vllm/knorm/attention_backend.py
+ create mode 100644 vllm/knorm/config.py
+ create mode 100644 vllm/knorm/hooks.py
+ create mode 100644 vllm/knorm/manager.py
+
+diff --git a/vllm/knorm/__init__.py b/vllm/knorm/__init__.py
+new file mode 100644
+index 000000000000..d3abe48f6927
+--- /dev/null
++++ b/vllm/knorm/__init__.py
+@@ -0,0 +1,41 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
++"""
++Knorm KV Cache Compression for vllm-hust.
++
++Knorm (Devoto et al., 2024) evicts KV cache blocks with high key L2 norms,
++which tend to receive lower attention scores during decoding.
++
++Usage:
++    export VLLM_KNORM_COMPRESSION_RATIO=0.5  # keep 50% of KV cache
++    export VLLM_KNORM_WARMUP_TOKENS=32       # protect first 32 tokens
++    vllm-hust serve /data/models/Qwen2.5-7B-Instruct --enforce-eager
++"""
++
++from vllm.knorm.attention_backend import (
++    clear_pending_norms,
++    get_pending_norms,
++    install_ascend_wrapper,
++    store_layer_norms,
++)
++from vllm.knorm.config import KnormConfig
++from vllm.knorm.hooks import attach_knorm_scores, collect_knorm_scores
++from vllm.knorm.manager import (
++    KnormFullAttentionManager,
++    drain_block_scores,
++    submit_block_scores,
++)
++
++__all__ = [
++    "KnormConfig",
++    "KnormFullAttentionManager",
++    "attach_knorm_scores",
++    "clear_pending_norms",
++    "collect_knorm_scores",
++    "drain_block_scores",
++    "get_pending_norms",
++    "install_ascend_wrapper",
++    "store_layer_norms",
++    "submit_block_scores",
++]
+diff --git a/vllm/knorm/attention_backend.py b/vllm/knorm/attention_backend.py
+new file mode 100644
+index 000000000000..62990e485bf0
+--- /dev/null
++++ b/vllm/knorm/attention_backend.py
+@@ -0,0 +1,133 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
++"""
++Attention wrapper that computes key L2 norms for Knorm.
++
++Norms from **all** attention layers are collected and averaged after
++the model forward completes. Works on both CUDA GPU and Ascend NPU.
++"""
++
++from __future__ import annotations
++
++import functools
++from typing import TYPE_CHECKING
++
++import torch
++
++from vllm.knorm.config import KnormConfig
++
++if TYPE_CHECKING:
++    from collections.abc import Callable
++
++# ---------------------------------------------------------------------------
++# Global buffer for pending per-token norms (on GPU).
++# ---------------------------------------------------------------------------
++_pending_norms: list[torch.Tensor] = []
++_original_ascend_forward: Callable | None = None
++
++
++def get_pending_norms() -> list[torch.Tensor]:
++    """Return pending norm tensors (still on GPU)."""
++    return list(_pending_norms)
++
++
++def clear_pending_norms() -> None:
++    """Clear the pending norm buffer."""
++    _pending_norms.clear()
++
++
++def store_layer_norms(norms: torch.Tensor) -> None:
++    """Store per-token key norms from one attention layer.
++
++    Args:
++        norms: Float tensor of shape ``[num_tokens]``, on GPU.
++    """
++    _pending_norms.append(norms.detach())
++
++
++# ---------------------------------------------------------------------------
++# Norm computation — device-agnostic
++# ---------------------------------------------------------------------------
++
++
++def compute_key_norms(key: torch.Tensor, reduce_op: str = "mean") -> torch.Tensor:
++    """Compute per-token importance score from key tensor.
++
++    Args:
++        key: shape ``[num_tokens, num_kv_heads, head_size]``
++        reduce_op: 'mean', 'max', or 'sum' across heads.
++
++    Returns:
++        shape ``[num_tokens]`` float32. Lower norm = more important.
++    """
++    head_norms = key.float().norm(dim=-1)  # [num_tokens, num_kv_heads]
++    if reduce_op == "max":
++        return head_norms.max(dim=1).values
++    elif reduce_op == "sum":
++        return head_norms.sum(dim=1)
++    else:  # mean (default)
++        return head_norms.mean(dim=1)
++
++
++# ---------------------------------------------------------------------------
++# Wrapper installation
++# ---------------------------------------------------------------------------
++
++
++def install_ascend_wrapper() -> None:
++    """Wrap attention impl forward to collect key norms (idempotent).
++
++    Auto-detects the platform:
++    - Ascend NPU: wraps ``CUSTOM`` slot (filled by vllm-ascend).
++    - CUDA GPU:  wraps ``FLASH_ATTN`` slot (built-in FlashAttention).
++    """
++    global _original_ascend_forward
++
++    if _original_ascend_forward is not None:
++        return
++
++    from vllm.v1.attention.backends.registry import AttentionBackendEnum
++
++    # Auto-detect platform: Ascend CUSTOM → FLASH_ATTN fallback
++    impl_cls: type
++    try:
++        backend_cls = AttentionBackendEnum.CUSTOM.get_class()
++        impl_cls = backend_cls.get_impl_cls()
++    except ValueError:
++        backend_cls = AttentionBackendEnum.FLASH_ATTN.get_class()
++        impl_cls = backend_cls.get_impl_cls()
++
++    _original_ascend_forward = impl_cls.forward  # type: ignore[attr-defined]
++    config = KnormConfig()
++
++    @functools.wraps(_original_ascend_forward)
++    def _patched_forward(
++        self,
++        layer,
++        query: torch.Tensor,
++        key: torch.Tensor,
++        value: torch.Tensor,
++        kv_cache,
++        attn_metadata,
++        output: torch.Tensor | None = None,
++        output_scale: torch.Tensor | None = None,
++        output_block_scale: torch.Tensor | None = None,
++    ) -> torch.Tensor:
++        if key is not None and config.is_active:
++            key_norms = compute_key_norms(key, config.norm_reduce_op)
++            store_layer_norms(key_norms)
++        return _original_ascend_forward(
++            self,
++            layer=layer,
++            query=query,
++            key=key,
++            value=value,
++            kv_cache=kv_cache,
++            attn_metadata=attn_metadata,
++            output=output,
++            output_scale=output_scale,
++            output_block_scale=output_block_scale,
++        )
++
++    impl_cls.forward = _patched_forward  # type: ignore[attr-defined]
+diff --git a/vllm/knorm/config.py b/vllm/knorm/config.py
+new file mode 100644
+index 000000000000..de940d2eefae
+--- /dev/null
++++ b/vllm/knorm/config.py
+@@ -0,0 +1,49 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
++"""Knorm configuration, read from environment variables."""
++
++from __future__ import annotations
++
++import os
++from dataclasses import dataclass, field
++
++
++@dataclass
++class KnormConfig:
++    """Knorm compression configuration.
++
++    All values are read from environment variables at construction time.
++    """
++
++    compression_ratio: float = field(
++        default_factory=lambda: float(
++            os.environ.get("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
++        )
++    )
++    """Fraction of KV cache blocks to KEEP. 1.0 = no compression."""
++
++    warmup_tokens: int = field(
++        default_factory=lambda: int(os.environ.get("VLLM_KNORM_WARMUP_TOKENS", "32"))
++    )
++    """Tokens at the sequence start to always keep (attention sink)."""
++
++    enabled: bool = field(
++        default_factory=lambda: os.environ.get("VLLM_KNORM_ENABLED", "1") == "1"
++    )
++    """Whether Knorm compression is enabled. Set to '0' to disable."""
++
++    score_aggregation: str = field(
++        default_factory=lambda: os.environ.get("VLLM_KNORM_SCORE_AGGREGATION", "min")
++    )
++    """How to aggregate token norms within a block: 'min', 'mean', or 'max'."""
++
++    norm_reduce_op: str = field(
++        default_factory=lambda: os.environ.get("VLLM_KNORM_NORM_REDUCE_OP", "mean")
++    )
++    """How to reduce norms across heads: 'mean', 'max', or 'sum'."""
++
++    @property
++    def is_active(self) -> bool:
++        """Return True if compression should be applied."""
++        return self.enabled and self.compression_ratio < 1.0
+diff --git a/vllm/knorm/hooks.py b/vllm/knorm/hooks.py
+new file mode 100644
+index 000000000000..2760437fdb68
+--- /dev/null
++++ b/vllm/knorm/hooks.py
+@@ -0,0 +1,89 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
++"""
++Runtime hook functions for Knorm.
++
++These are called *explicitly* from the vllm-hust execution loop
++(not via monkey-patch). Each function is a single-purpose hook
++that is invoked at the appropriate point in the model runner
++or scheduler lifecycle.
++"""
++
++from __future__ import annotations
++
++import torch
++
++from vllm.knorm.attention_backend import clear_pending_norms, get_pending_norms
++
++
++def collect_knorm_scores(runner, input_batch) -> None:
++    """Collect key L2 norms after model forward and aggregate per-block.
++
++    Called from ``GPUModelRunner.execute_model`` after the model forward
++    completes but before ``sample_tokens``.
++
++    Stores results in ``runner._knorm_scores`` as:
++        {req_id: [(block_idx, min_norm), ...]}
++    """
++    if not hasattr(runner, "kv_cache_config") or runner.kv_cache_config is None:
++        runner._knorm_scores = None
++        return
++
++    norms_list = get_pending_norms()
++    if not norms_list:
++        runner._knorm_scores = None
++        return
++
++    # Stack norms from all layers, average. Shape: [num_tokens]
++    all_norms = torch.stack(norms_list).float().mean(dim=0)
++    clear_pending_norms()
++
++    token_norms = all_norms.cpu().numpy()
++    num_tokens = len(token_norms)
++
++    req_ids = input_batch.req_ids
++    num_reqs = input_batch.num_reqs
++    num_scheduled = input_batch.num_tokens_no_spec[:num_reqs]
++    positions_np = runner.positions[:num_tokens].cpu().numpy()
++    block_size = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
++
++    # Aggregate: per (request_id, block_idx) → min norm (lower = more important)
++    scores: dict[str, dict[int, float]] = {}
++    idx = 0
++    for req_id, num_toks in zip(req_ids, num_scheduled, strict=False):
++        nt = int(num_toks)
++        req_scores: dict[int, float] = {}
++        for _ in range(nt):
++            if idx >= num_tokens:
++                break
++            pos = int(positions_np[idx])
++            block_idx = pos // block_size
++            norm_val = float(token_norms[idx])
++            req_scores[block_idx] = min(req_scores.get(block_idx, norm_val), norm_val)
++            idx += 1
++        if req_scores:
++            scores[req_id] = req_scores
++
++    if scores:
++        formatted: dict[str, list[tuple[int, float]]] = {}
++        for rid, bdict in scores.items():
++            formatted[rid] = list(bdict.items())
++        runner._knorm_scores = formatted
++    else:
++        runner._knorm_scores = None
++
++
++def attach_knorm_scores(runner, result) -> None:
++    """Attach knorm block scores to the model runner output.
++
++    Called from ``GPUModelRunner.sample_tokens`` before returning.
++
++    The scores are later read by ``Scheduler.update_from_output`` and
++    routed to ``KnormFullAttentionManager``.
++    """
++    knorm_scores = getattr(runner, "_knorm_scores", None)
++    if not knorm_scores or result is None:
++        return
++
++    result.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
+diff --git a/vllm/knorm/manager.py b/vllm/knorm/manager.py
+new file mode 100644
+index 000000000000..50c5d921c8c3
+--- /dev/null
++++ b/vllm/knorm/manager.py
+@@ -0,0 +1,149 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
++"""Knorm KV cache manager — evicts blocks based on key L2 norms."""
++
++from __future__ import annotations
++
++import math
++from collections import defaultdict
++from typing import TYPE_CHECKING
++
++from vllm.knorm.config import KnormConfig
++from vllm.utils.math_utils import cdiv
++from vllm.v1.core.kv_cache_utils import KVCacheBlock
++from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
++
++if TYPE_CHECKING:
++    from vllm.v1.kv_cache_interface import KVCacheSpec
++
++# ---------------------------------------------------------------------------
++# Global bridge: model runner (attention) → KV cache manager
++# ---------------------------------------------------------------------------
++_pending_block_scores: dict[str, list[tuple[int, float]]] = {}
++
++
++def submit_block_scores(scores: dict[str, list[tuple[int, float]]]) -> None:
++    """Store block-level importance scores from the model runner."""
++    _pending_block_scores.update(scores)
++
++
++def drain_block_scores() -> dict[str, list[tuple[int, float]]]:
++    """Read and clear pending scores. Called by manager each scheduling step."""
++    result = dict(_pending_block_scores)
++    _pending_block_scores.clear()
++    return result
++
++
++# ---------------------------------------------------------------------------
++# KnormFullAttentionManager
++# ---------------------------------------------------------------------------
++
++
++class KnormFullAttentionManager(FullAttentionManager):
++    """Full attention manager with Knorm-based KV cache compression.
++
++    Overrides ``get_num_skipped_tokens`` and ``remove_skipped_blocks``
++    to evict blocks from the prefix based on compression ratio.
++
++    When ``compression_ratio == 1.0`` or ``enabled == False``, behaves
++    identically to :class:`FullAttentionManager`.
++    """
++
++    def __init__(self, kv_cache_spec: KVCacheSpec, **kwargs) -> None:
++        super().__init__(kv_cache_spec, **kwargs)
++        self._config = KnormConfig()
++        # Per-request: block_index_in_request → importance_score
++        # Lower score = lower norm = higher importance = should be kept.
++        self._block_scores: dict[str, dict[int, float]] = defaultdict(dict)
++
++    # ------------------------------------------------------------------
++    # Public API for receiving norm data
++    # ------------------------------------------------------------------
++
++    def update_block_scores(self, scores: dict[str, list[tuple[int, float]]]) -> None:
++        """Ingest importance scores. Lower score = more important."""
++        for req_id, block_scores in scores.items():
++            req_dict = self._block_scores[req_id]
++            for block_idx, score in block_scores:
++                if block_idx in req_dict:
++                    req_dict[block_idx] = min(req_dict[block_idx], score)
++                else:
++                    req_dict[block_idx] = score
++
++    # ------------------------------------------------------------------
++    # Overrides — core eviction logic
++    # ------------------------------------------------------------------
++
++    def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
++        """Return tokens to evict from the prefix based on compression ratio."""
++        if not self._config.is_active:
++            return 0
++
++        total_blocks_for_tokens = cdiv(num_computed_tokens, self.block_size)
++        warmup_blocks = max(1, self._config.warmup_tokens // self.block_size)
++        if total_blocks_for_tokens <= warmup_blocks:
++            return 0
++
++        target_keep_blocks = max(
++            warmup_blocks,
++            math.ceil(total_blocks_for_tokens * self._config.compression_ratio),
++        )
++        evict_blocks = total_blocks_for_tokens - target_keep_blocks
++        if evict_blocks <= 0:
++            return 0
++        return evict_blocks * self.block_size
++
++    def remove_skipped_blocks(
++        self, request_id: str, total_computed_tokens: int
++    ) -> None:
++        """Remove blocks from the prefix.
++
++        Drains global score buffer, then frees the oldest blocks from
++        the prefix, preserving warmup region.
++        """
++        scores = drain_block_scores()
++        if scores:
++            self.update_block_scores(scores)
++
++        num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
++        if num_skipped_tokens <= 0:
++            return
++
++        blocks = self.req_to_blocks[request_id]
++        block_size = self.block_size
++        num_skipped_blocks = min(
++            num_skipped_tokens // block_size,
++            len(blocks),
++        )
++        warmup_blocks = max(0, self._config.warmup_tokens // block_size)
++
++        removed_cached: list[KVCacheBlock] = []
++        removed_uncached: list[KVCacheBlock] = []
++
++        for i in range(num_skipped_blocks - 1, -1, -1):
++            if i >= len(blocks):
++                continue
++            if blocks[i] is self._null_block:
++                break
++            if i < warmup_blocks:
++                break
++            if blocks[i].block_hash is None:
++                removed_uncached.append(blocks[i])
++            else:
++                removed_cached.append(blocks[i])
++            blocks[i] = self._null_block
++
++        if removed_cached:
++            self.block_pool.free_blocks(removed_cached)
++        if removed_uncached:
++            self.block_pool.free_blocks(removed_uncached, prepend=True)
++
++        if request_id in self._block_scores:
++            for i in range(num_skipped_blocks):
++                self._block_scores[request_id].pop(i, None)
++
++    def free(self, request_id: str) -> None:
++        """Free blocks and clean up score records."""
++        super().free(request_id)
++        self._block_scores.pop(request_id, None)
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 3f61b67fba0f..54d61555fe1f 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1318,6 +1318,13 @@ def update_from_output(
+         scheduler_output: SchedulerOutput,
+         model_runner_output: ModelRunnerOutput,
+     ) -> dict[int, EngineCoreOutputs]:
++        # Knorm: route block scores from model runner to KV cache manager.
++        knorm_scores = getattr(model_runner_output, "knorm_block_scores", None)
++        if knorm_scores:
++            from vllm.knorm.manager import submit_block_scores
++
++            submit_block_scores(knorm_scores)
++
+         sampled_token_ids = model_runner_output.sampled_token_ids
+         num_sampled_tokens = model_runner_output.num_sampled_tokens
+         logprobs = model_runner_output.logprobs
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 4887679c889f..ed4a9a9afb08 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1173,3 +1173,21 @@ def get_manager_for_kv_cache_spec(
+         )
+     manager = manager_class(kv_cache_spec, **kwargs)
+     return manager
++
++
++# ---------------------------------------------------------------------------
++# Knorm integration: override FullAttentionSpec → KnormFullAttentionManager.
++# Placed at end-of-file to avoid circular import (KnormFullAttentionManager
++# imports FullAttentionManager from this module, which is already defined).
++# ---------------------------------------------------------------------------
++def _install_knorm_manager() -> None:
++    """Replace FullAttentionSpec manager with KnormFullAttentionManager."""
++    try:
++        from vllm.knorm.manager import KnormFullAttentionManager
++
++        spec_manager_map[FullAttentionSpec] = KnormFullAttentionManager
++    except ImportError:
++        pass  # knorm module not installed — use default FullAttentionManager
++
++
++_install_knorm_manager()
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index a783549780b4..603cb9fea99f 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -855,6 +855,8 @@ def __init__(
+         # Ephemeral state transferred between execute_model() and sample_tokens().
+         self.execute_model_state: ExecuteModelState | None = None
+         self.kv_connector_output: KVConnectorOutput | None = None
++        self._knorm_scores: dict | None = None
++        self._knorm_wrapper_installed: bool = False
+         self.mamba_state_idx: dict[str, int] = {}
+         self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+         self.layerwise_nvtx_hooks_registered = False
+@@ -3864,6 +3866,13 @@ def execute_model(
+                 "after execute_model() returns None."
+             )
+ 
++        # Knorm: install Ascend attention wrapper on first forward.
++        if not getattr(self, "_knorm_wrapper_installed", False):
++            from vllm.knorm.attention_backend import install_ascend_wrapper
++
++            install_ascend_wrapper()
++            self._knorm_wrapper_installed = True
++
+         if self.routed_experts_initialized:
+             capturer = RoutedExpertsCapturer.get_instance()
+             if capturer is not None:
+@@ -4203,6 +4212,12 @@ def execute_model(
+         if deferred_state_corrections_fn:
+             deferred_state_corrections_fn()
+ 
++        # Knorm: collect key L2 norms from attention backend after forward.
++        if get_pp_group().is_last_rank:
++            from vllm.knorm.hooks import collect_knorm_scores
++
++            collect_knorm_scores(self, self.input_batch)
++
+         return None
+ 
+     @torch.inference_mode
+@@ -4419,6 +4434,9 @@ def propose_draft_token_ids(sampled_token_ids):
+             )
+ 
+         if not self.use_async_scheduling:
++            from vllm.knorm.hooks import attach_knorm_scores
++
++            attach_knorm_scores(self, output)
+             return output
+ 
+         with record_function_or_nullcontext(
+@@ -4442,6 +4460,11 @@ def propose_draft_token_ids(sampled_token_ids):
+                 async_output.async_copy_ready_event,
+             )
+ 
++        # Knorm: attach scores directly (not via attach_knorm_scores,
++        # which calls get_output() — a destructive one-shot method).
++        knorm_scores = getattr(self, "_knorm_scores", None)
++        if knorm_scores:
++            async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
+         return async_output
+ 
+     def _pp_broadcast_prev_sampled_token_ids(

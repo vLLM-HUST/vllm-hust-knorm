@@ -1,0 +1,240 @@
+From 9f906ff2bf1c361d02bff973c10e735aea951bdf Mon Sep 17 00:00:00 2001
+From: kotoriqaq0 <2216804318@qq.com>
+Date: Wed, 1 Jul 2026 09:50:19 +0800
+Subject: [PATCH] fix: correct Knorm eviction to use key-norm scores and
+ protect warmup
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The original eviction walked the prefix block table right-to-left,
+evicting every block it encountered until hitting a null block.  This
+behaved like a fixed-ratio sliding window: it ignored the per-block
+importance scores that Knorm collects from attention layers, and it
+could accidentally evict warmup blocks.
+
+Changes:
+
+1. knorm/manager.py — score-based candidate selection:
+   Replace the sequential right-to-left loop with a candidate pool that
+   collects eligible blocks from the prefix, sorts them by key L2 norm
+   (highest norm = least important = evicted first), and truncates to
+   the compression-ratio target.  Unscored blocks are evicted last.
+   Fix warmup_blocks calculation (max(1, ...)) to be consistent with
+   get_num_skipped_tokens, ensuring the attention-sink region is never
+   evicted.  Replace break with continue so scattered null blocks from
+   prior evictions do not prevent scanning later candidates.
+
+2. block_pool.py — prepend support in free_blocks():
+   Add a prepend parameter.  When True, freed blocks are inserted at
+   the head of the free queue for immediate reuse.  Knorm uses this for
+   uncached (block_hash=None) blocks; cached blocks follow the default
+   LRU behavior.
+
+3. kv_cache_utils.py — FreeKVCacheBlockQueue.prependleft_n():
+   New method to insert blocks at the front of the free block linked list.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: kotoriqaq0 <2216804318@qq.com>
+---
+ vllm/knorm/manager.py          | 72 ++++++++++++++++++++++++++--------
+ vllm/v1/core/block_pool.py     | 23 +++++++++--
+ vllm/v1/core/kv_cache_utils.py | 32 +++++++++++++++
+ 3 files changed, 106 insertions(+), 21 deletions(-)
+
+diff --git a/vllm/knorm/manager.py b/vllm/knorm/manager.py
+index 50c5d921c8c3..801b9920c23f 100644
+--- a/vllm/knorm/manager.py
++++ b/vllm/knorm/manager.py
+@@ -97,15 +97,19 @@ def get_num_skipped_tokens(self, num_computed_tokens: int) -> int:
+     def remove_skipped_blocks(
+         self, request_id: str, total_computed_tokens: int
+     ) -> None:
+-        """Remove blocks from the prefix.
++        """Remove the *least important* blocks from the prefix.
+ 
+-        Drains global score buffer, then frees the oldest blocks from
+-        the prefix, preserving warmup region.
++        Drains the global score buffer, then evicts blocks with the
++        highest key L2 norm (lowest importance), preserving the warmup
++        region.  Blocks without scores (newly allocated, not yet observed
++        in a forward pass) are evicted last.
+         """
++        # ── 1. Drain and ingest pending scores ──
+         scores = drain_block_scores()
+         if scores:
+             self.update_block_scores(scores)
+ 
++        # ── 2. Determine how many tokens (blocks) to evict ──
+         num_skipped_tokens = self.get_num_skipped_tokens(total_computed_tokens)
+         if num_skipped_tokens <= 0:
+             return
+@@ -116,32 +120,66 @@ def remove_skipped_blocks(
+             num_skipped_tokens // block_size,
+             len(blocks),
+         )
+-        warmup_blocks = max(0, self._config.warmup_tokens // block_size)
++        warmup_blocks = max(1, self._config.warmup_tokens // block_size)
++        target_evict = num_skipped_blocks - warmup_blocks
++        if target_evict <= 0:
++            return
+ 
+-        removed_cached: list[KVCacheBlock] = []
+-        removed_uncached: list[KVCacheBlock] = []
++        # ── 3. Collect candidate blocks from the eviction range ──
++        # Exclude warmup blocks and already-null blocks.
++        req_scores = self._block_scores.get(request_id, {})
++        scored: list[tuple[int, KVCacheBlock, float]] = []  # (idx, block, score)
++        unscored: list[tuple[int, KVCacheBlock]] = []  # (idx, block)
+ 
+-        for i in range(num_skipped_blocks - 1, -1, -1):
++        for i in range(warmup_blocks, num_skipped_blocks):
+             if i >= len(blocks):
+                 continue
+-            if blocks[i] is self._null_block:
+-                break
+-            if i < warmup_blocks:
+-                break
+-            if blocks[i].block_hash is None:
+-                removed_uncached.append(blocks[i])
++            block = blocks[i]
++            if block is self._null_block:
++                continue  # skip individually; no early break
++            s = req_scores.get(i)
++            if s is not None:
++                scored.append((i, block, s))
++            else:
++                unscored.append((i, block))
++
++        # ── 4. Sort: highest score (highest norm = least important) first ──
++        scored.sort(key=lambda x: x[2], reverse=True)
++
++        # ── 5. Merge and truncate to the target count ──
++        eviction_candidates: list[tuple[int, KVCacheBlock]] = [
++            (idx, blk) for idx, blk, _ in scored
++        ]
++        eviction_candidates.extend(unscored)
++        num_to_evict = min(target_evict, len(eviction_candidates))
++        if num_to_evict <= 0:
++            return
++        to_evict = eviction_candidates[:num_to_evict]
++
++        # ── 6. Separate cached vs. uncached, replace with null_block ──
++        removed_cached: list[KVCacheBlock] = []
++        removed_uncached: list[KVCacheBlock] = []
++
++        for idx, block in to_evict:
++            if block.block_hash is not None:
++                removed_cached.append(block)
+             else:
+-                removed_cached.append(blocks[i])
+-            blocks[i] = self._null_block
++                removed_uncached.append(block)
++            blocks[idx] = self._null_block
+ 
++        # ── 7. Free blocks ──
++        # Cached blocks go to the back of the free queue (LRU — give
++        # prefix cache a chance to hit).  Uncached blocks go to the
++        # front (immediate reuse).
+         if removed_cached:
+             self.block_pool.free_blocks(removed_cached)
+         if removed_uncached:
+             self.block_pool.free_blocks(removed_uncached, prepend=True)
+ 
++        # ── 8. Clean up score records for evicted indices ──
+         if request_id in self._block_scores:
+-            for i in range(num_skipped_blocks):
+-                self._block_scores[request_id].pop(i, None)
++            for idx, _ in to_evict:
++                self._block_scores[request_id].pop(idx, None)
+ 
+     def free(self, request_id: str) -> None:
+         """Free blocks and clean up score records."""
+diff --git a/vllm/v1/core/block_pool.py b/vllm/v1/core/block_pool.py
+index 9097079ef33a..16310b5baae2 100644
+--- a/vllm/v1/core/block_pool.py
++++ b/vllm/v1/core/block_pool.py
+@@ -405,21 +405,36 @@ def touch(self, blocks: Sequence[KVCacheBlock]) -> None:
+             if self.metrics_collector:
+                 self.metrics_collector.on_block_accessed(block)
+ 
+-    def free_blocks(self, ordered_blocks: Iterable[KVCacheBlock]) -> None:
++    def free_blocks(
++        self,
++        ordered_blocks: Iterable[KVCacheBlock],
++        prepend: bool = False,
++    ) -> None:
+         """Free a list of blocks. The blocks should be ordered by their
+         eviction priority, where the first block will be evicted first.
+ 
+         Args:
+             ordered_blocks: A list of blocks to free ordered by their eviction
+                 priority.
++            prepend: If ``True``, blocks are inserted at the head of the free
++                queue (reused first). If ``False`` (default), blocks are
++                appended to the tail (standard LRU-like behavior).
+         """
+         # Materialize the iterable to allow multiple passes.
+         blocks_list = list(ordered_blocks)
+         for block in blocks_list:
+             block.ref_cnt -= 1
+-        self.free_block_queue.append_n(
+-            [block for block in blocks_list if block.ref_cnt == 0 and not block.is_null]
+-        )
++
++        freed = [
++            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
++        ]
++        if not freed:
++            return
++
++        if prepend:
++            self.free_block_queue.prependleft_n(freed)
++        else:
++            self.free_block_queue.append_n(freed)
+ 
+     def evict_blocks(self, block_ids: set[int]) -> None:
+         """evict blocks from the prefix cache by their block IDs.
+diff --git a/vllm/v1/core/kv_cache_utils.py b/vllm/v1/core/kv_cache_utils.py
+index b57e10b67faa..ce25e1a43dac 100644
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -349,6 +349,38 @@ def append_n(self, blocks: list[KVCacheBlock]) -> None:
+ 
+         self.num_free_blocks += len(blocks)
+ 
++    def prependleft_n(self, blocks: list[KVCacheBlock]) -> None:
++        """Insert blocks at the head of the free queue.
++
++        These blocks will be allocated first by subsequent
++        :meth:`popleft_n` calls.
++
++        Args:
++            blocks: Blocks to insert at the front, in the order they
++                    should be allocated (``blocks[0]`` is allocated
++                    first).
++        """
++        if not blocks:
++            return
++
++        old_first = self.fake_free_list_head.next_free_block
++        assert old_first is not None
++
++        # Add inter-connections between consecutive blocks.
++        for i in range(len(blocks) - 1):
++            blocks[i].next_free_block = blocks[i + 1]
++            blocks[i + 1].prev_free_block = blocks[i]
++
++        # Wire fake_head → blocks[0]
++        self.fake_free_list_head.next_free_block = blocks[0]
++        blocks[0].prev_free_block = self.fake_free_list_head
++
++        # Wire blocks[-1] → old_first
++        blocks[-1].next_free_block = old_first
++        old_first.prev_free_block = blocks[-1]
++
++        self.num_free_blocks += len(blocks)
++
+     def get_all_free_blocks(self) -> list[KVCacheBlock]:
+         """Get all free blocks in the free list. Mainly used for testing.
+ 

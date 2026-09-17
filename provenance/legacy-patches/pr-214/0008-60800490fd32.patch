@@ -1,0 +1,1623 @@
+From 27112ce248dbbc89151d5f4333b9a40549aeeb13 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <shuhao_zhang@hust.edu.cn>
+Date: Sat, 15 Aug 2026 12:21:01 +0800
+Subject: [PATCH 1/2] feat(spec-decode): negotiate checkpoint-aware proposer
+ capabilities (#246)
+
+## Summary
+
+- add a typed, checkpoint-aware speculative capability descriptor and
+fail-closed negotiation before device/weight allocation
+- distinguish DSpark from legacy MTP using checkpoint markers and
+advertise platform proposer identities without importing device code
+- expose the resolved contract through configuration, startup logs,
+`/v1/models`, Prometheus, and Ray metrics
+- add drafted/accepted/rejected, acceptance-rate, proposer/verification
+latency, and effective-tokens-per-forward telemetry
+
+Closes #245.
+
+## Non-duplicate check
+
+Searched open PRs for `#245`, `speculative capability`, `DSpark MTP`,
+and related terms before implementation; no overlapping open PR was
+found. Issue #245 had no competing implementation linked in comments.
+
+## Tests
+
+- `ruff format --check` on all changed Python files
+- `ruff check` on all changed Python files
+- `git diff --check`
+- offline disposable Ascend-image test container, no NPU mounted and no
+network:
+- 12 passed: capability matrix, `/v1/models` metadata, Prometheus
+metrics, and interval logs
+  - 2 passed: existing `SpeculativeConfig` ngram compatibility tests
+
+The image lacks the optional `pytest-asyncio` test dependency; the new
+model-card test intentionally uses standard-library `asyncio.run` so it
+remains self-contained. Existing async tests were not selected in the
+focused run.
+
+## AI assistance
+
+OpenAI Codex assisted with implementation, tests, documentation, and
+review. The changes were manually audited against the actual DeepSeek-V4
+DSpark checkpoint markers and the concrete `DSparkSpeculator`
+implementation path.
+---
+ docs/design/metrics.md                        |  19 ++
+ docs/features/speculative_decoding/README.md  |  16 ++
+ tests/config/test_speculative_capability.py   | 126 ++++++++++++
+ .../serve/lora/test_serving_models.py         |  29 ++-
+ tests/v1/spec_decode/test_metrics_contract.py | 124 +++++++++++
+ vllm/config/__init__.py                       |   6 +
+ vllm/config/speculative.py                    |  40 ++++
+ vllm/config/speculative_capability.py         | 193 ++++++++++++++++++
+ vllm/config/vllm.py                           |  28 +++
+ vllm/entrypoints/openai/engine/protocol.py    |   1 +
+ vllm/entrypoints/openai/models/serving.py     |   9 +
+ vllm/platforms/cuda.py                        |   9 +
+ vllm/platforms/interface.py                   |  17 ++
+ vllm/v1/core/sched/scheduler.py               |  16 ++
+ vllm/v1/metrics/loggers.py                    |   1 +
+ vllm/v1/metrics/ray_wrappers.py               |   2 +
+ vllm/v1/outputs.py                            |   5 +
+ vllm/v1/spec_decode/metrics.py                | 177 +++++++++++++++-
+ vllm/v1/worker/gpu/model_runner.py            |  20 ++
+ vllm/v1/worker/gpu_model_runner.py            |  19 ++
+ 20 files changed, 853 insertions(+), 4 deletions(-)
+ create mode 100644 tests/config/test_speculative_capability.py
+ create mode 100644 tests/v1/spec_decode/test_metrics_contract.py
+ create mode 100644 vllm/config/speculative_capability.py
+
+diff --git a/docs/design/metrics.md b/docs/design/metrics.md
+index 7b463b8750c7..08b3bf242a15 100644
+--- a/docs/design/metrics.md
++++ b/docs/design/metrics.md
+@@ -560,6 +560,25 @@ Some legacy metrics are specific to "speculative decoding". This is where
+ we generate candidate tokens using a faster, approximate method or
+ model and then validate those tokens with the larger model.
+ 
++Current V1 servers expose the resolved capability and operational metrics:
++
++- `vllm:spec_decode_capability` (Gauge with method, proposer, platform, and status labels)
++- `vllm:spec_decode_num_drafts` (Counter)
++- `vllm:spec_decode_num_draft_tokens` (Counter)
++- `vllm:spec_decode_num_accepted_tokens` (Counter)
++- `vllm:spec_decode_num_rejected_tokens` (Counter)
++- `vllm:spec_decode_acceptance_rate` (Gauge)
++- `vllm:spec_decode_proposer_latency_seconds` (Histogram)
++- `vllm:spec_decode_verification_latency_seconds` (Histogram)
++- `vllm:spec_decode_effective_tokens_per_forward` (Gauge)
++
++The capability gauge is also emitted for disabled engines, so operators can
++distinguish an intentional no-spec baseline from an enabled proposer. An
++unavailable request fails before engine startup with a structured capability
++error and therefore cannot expose runtime metrics.
++
++The legacy metrics below are retained here as historical design context.
++
+ - `vllm:spec_decode_draft_acceptance_rate` (Gauge)
+ - `vllm:spec_decode_efficiency` (Gauge)
+ - `vllm:spec_decode_num_accepted_tokens` (Counter)
+diff --git a/docs/features/speculative_decoding/README.md b/docs/features/speculative_decoding/README.md
+index ceb25dbfd02f..64dfca8db721 100644
+--- a/docs/features/speculative_decoding/README.md
++++ b/docs/features/speculative_decoding/README.md
+@@ -70,6 +70,22 @@ object; they are not an exhaustive schema reference.
+ For more details, see the generated [engine arguments reference](../../configuration/engine_args.md)
+ and the API docs for [vllm.config.SpeculativeConfig][].
+ 
++## Capability negotiation
++
++Before loading weights, vLLM resolves the requested method against checkpoint
++metadata and the active platform plugin's registered proposers. DSpark markers
++take precedence over generic MTP counters, so a DSpark checkpoint is never
++silently routed through legacy MTP. An incompatible explicit request fails with
++a structured `SpeculativeCapabilityError` containing the requested method,
++detected checkpoint method, missing capability, and remediation.
++
++The same machine-readable descriptor is available as
++`VllmConfig.speculative_capability` and in each `/v1/models` card under
++`speculative_capability`. Engines without speculative decoding report
++`status="disabled"`; a missing platform proposer raises a structured descriptor
++with `status="unavailable"` before the server starts. Deployment controllers
++should consume the descriptor instead of parsing log text.
++
+ ### Common keys
+ 
+ These keys are commonly used across speculative decoding setups, though some
+diff --git a/tests/config/test_speculative_capability.py b/tests/config/test_speculative_capability.py
+new file mode 100644
+index 000000000000..b6391c18deca
+--- /dev/null
++++ b/tests/config/test_speculative_capability.py
+@@ -0,0 +1,126 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++import pytest
++
++from vllm.config.speculative_capability import (
++    SpeculativeCapabilityError,
++    detect_checkpoint_speculative_capability,
++    resolve_speculative_capability,
++)
++
++PORTABLE_PROPOSERS = {
++    "mtp": "builtin:mtp",
++    "draft_model": "builtin:draft_model",
++    "ngram": "builtin:ngram",
++}
++
++
++def test_dspark_markers_take_precedence_over_mtp_counter() -> None:
++    config = {
++        "model_type": "deepseek_v4",
++        "architectures": ["DeepseekV4ForCausalLM"],
++        "num_nextn_predict_layers": 1,
++        "dspark_block_size": 5,
++        "dspark_target_layer_ids": [40, 41, 42],
++    }
++
++    method, evidence = detect_checkpoint_speculative_capability(config)
++
++    assert method == "dspark"
++    assert "dspark_block_size" in evidence
++    assert "num_nextn_predict_layers" not in evidence
++
++
++def test_dspark_checkpoint_rejects_mtp_request() -> None:
++    capability = resolve_speculative_capability(
++        requested_method="mtp",
++        hf_config={
++            "num_nextn_predict_layers": 1,
++            "dspark_markov_rank": 256,
++        },
++        platform="cuda",
++        registered_proposers={**PORTABLE_PROPOSERS, "dspark": "EagleProposer"},
++    )
++
++    assert capability.status == "unavailable"
++    assert capability.requested_method == "mtp"
++    assert capability.detected_checkpoint_method == "dspark"
++    assert capability.missing_capability == "checkpoint:mtp"
++    with pytest.raises(SpeculativeCapabilityError) as exc_info:
++        raise SpeculativeCapabilityError(capability)
++    assert exc_info.value.to_dict()["detected_checkpoint_method"] == "dspark"
++
++
++def test_mtp_checkpoint_resolves_mtp_proposer() -> None:
++    capability = resolve_speculative_capability(
++        requested_method="mtp",
++        hf_config={"num_nextn_predict_layers": 1},
++        platform="cuda",
++        registered_proposers=PORTABLE_PROPOSERS,
++    )
++
++    assert capability.status == "enabled"
++    assert capability.resolved_method == "mtp"
++    assert capability.proposer == "builtin:mtp"
++
++
++@pytest.mark.parametrize("registered_proposers", [{}, {"ngram": "NgramProposer"}])
++def test_missing_or_unsupported_platform_proposer_fails_closed(
++    registered_proposers: dict[str, str],
++) -> None:
++    capability = resolve_speculative_capability(
++        requested_method="mtp",
++        hf_config={"num_nextn_predict_layers": 1},
++        platform="unsupported",
++        registered_proposers=registered_proposers,
++    )
++
++    assert capability.status == "unavailable"
++    assert capability.resolved_method == "none"
++    assert capability.missing_capability == "unsupported:mtp_proposer"
++    assert "platform plugin" in (capability.remediation or "")
++
++
++def test_no_spec_baseline_reports_detected_but_disabled() -> None:
++    capability = resolve_speculative_capability(
++        requested_method=None,
++        hf_config={"dspark_noise_token_id": 128799},
++        platform="ascend",
++        registered_proposers=PORTABLE_PROPOSERS,
++    )
++
++    assert capability.status == "disabled"
++    assert capability.requested_method == "none"
++    assert capability.detected_checkpoint_method == "dspark"
++    assert capability.resolved_method == "none"
++    assert capability.proposer == "none"
++
++
++def test_external_draft_model_does_not_require_target_embedded_modules() -> None:
++    capability = resolve_speculative_capability(
++        requested_method="draft_model",
++        hf_config={},
++        platform="cuda",
++        registered_proposers=PORTABLE_PROPOSERS,
++    )
++
++    assert capability.status == "enabled"
++    assert capability.detected_checkpoint_method == "none"
++    assert capability.resolved_method == "draft_model"
++
++
++def test_exact_runtime_method_proposer_precedes_family_fallback() -> None:
++    capability = resolve_speculative_capability(
++        requested_method="eagle3",
++        hf_config={},
++        platform="cuda",
++        registered_proposers={
++            "draft_model": "builtin:draft_model",
++            "eagle3": "builtin:eagle3",
++        },
++    )
++
++    assert capability.requested_method == "draft_model"
++    assert capability.resolved_method == "draft_model"
++    assert capability.proposer == "builtin:eagle3"
+diff --git a/tests/entrypoints/serve/lora/test_serving_models.py b/tests/entrypoints/serve/lora/test_serving_models.py
+index 0cab3fd42cff..ca5f2283e832 100644
+--- a/tests/entrypoints/serve/lora/test_serving_models.py
++++ b/tests/entrypoints/serve/lora/test_serving_models.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ 
++import asyncio
+ from http import HTTPStatus
+ from unittest.mock import MagicMock
+ 
+@@ -13,7 +14,10 @@
+     ErrorResponse,
+ )
+ from vllm.entrypoints.openai.models.protocol import BaseModelPath
+-from vllm.entrypoints.openai.models.serving import OpenAIServingModels
++from vllm.entrypoints.openai.models.serving import (
++    OpenAIModelRegistry,
++    OpenAIServingModels,
++)
+ from vllm.entrypoints.pooling.base.serving import PoolingServingBase
+ from vllm.entrypoints.pooling.typing import PoolingServeContext
+ from vllm.entrypoints.serve.lora.protocol import (
+@@ -60,6 +64,29 @@ async def test_serving_model_name():
+     assert serving_models.model_name(request) == request.lora_name
+ 
+ 
++def test_model_card_exposes_speculative_capability():
++    model_config = MagicMock(spec=ModelConfig)
++    model_config.max_model_len = 2048
++    capability = {
++        "requested_method": "none",
++        "detected_checkpoint_method": "dspark",
++        "resolved_method": "none",
++        "proposer": "none",
++        "platform": "ascend",
++        "status": "disabled",
++        "evidence": ["dspark_block_size"],
++    }
++    registry = OpenAIModelRegistry(
++        model_config=model_config,
++        base_model_paths=BASE_MODEL_PATHS,
++        speculative_capability=capability,
++    )
++
++    models = asyncio.run(registry.show_available_models())
++
++    assert models.data[0].speculative_capability == capability
++
++
+ @pytest.mark.asyncio
+ async def test_load_lora_adapter_success():
+     serving_models = await _async_serving_models_init()
+diff --git a/tests/v1/spec_decode/test_metrics_contract.py b/tests/v1/spec_decode/test_metrics_contract.py
+new file mode 100644
+index 000000000000..ba96bf708433
+--- /dev/null
++++ b/tests/v1/spec_decode/test_metrics_contract.py
+@@ -0,0 +1,124 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.config.speculative_capability import SpeculativeCapability
++from vllm.v1.spec_decode.metrics import (
++    SpecDecodingLogging,
++    SpecDecodingProm,
++    SpecDecodingStats,
++)
++
++
++class _FakeMetric:
++    def __init__(self, **kwargs):
++        self.name = kwargs["name"]
++        self.label_values = ()
++        self.increments: list[float] = []
++        self.sets: list[float] = []
++        self.observations: list[float] = []
++
++    def labels(self, *values):
++        self.label_values = values
++        return self
++
++    def inc(self, value=1.0):
++        self.increments.append(value)
++
++    def set(self, value):
++        self.sets.append(value)
++
++    def observe(self, value):
++        self.observations.append(value)
++
++
++class _TestSpecDecodingProm(SpecDecodingProm):
++    _counter_cls = _FakeMetric
++    _gauge_cls = _FakeMetric
++    _histogram_cls = _FakeMetric
++
++
++def _capability(status: str = "enabled") -> SpeculativeCapability:
++    return SpeculativeCapability(
++        requested_method="mtp" if status == "enabled" else "none",
++        detected_checkpoint_method="mtp",
++        resolved_method="mtp" if status == "enabled" else "none",
++        proposer="builtin:mtp" if status == "enabled" else "none",
++        platform="cuda",
++        status=status,  # type: ignore[arg-type]
++    )
++
++
++def test_disabled_capability_gauge_is_exposed_without_runtime_metrics() -> None:
++    metrics = _TestSpecDecodingProm(
++        speculative_config=None,
++        labelnames=["model_name", "engine"],
++        per_engine_labelvalues={0: ["model", "0"]},
++        capability=_capability("disabled"),
++    )
++
++    gauge = metrics.gauge_spec_decode_capability[0]
++    assert gauge.sets == [1]
++    assert gauge.label_values[-6:] == (
++        "none",
++        "mtp",
++        "none",
++        "none",
++        "cuda",
++        "disabled",
++    )
++    assert metrics.spec_decoding_enabled is False
++
++
++def test_operational_metrics_cover_acceptance_latency_and_effective_tokens() -> None:
++    metrics = _TestSpecDecodingProm(
++        speculative_config=SimpleNamespace(num_speculative_tokens=3),
++        labelnames=["model_name", "engine"],
++        per_engine_labelvalues={0: ["model", "0"]},
++        capability=_capability(),
++    )
++    stats = SpecDecodingStats.new(3)
++    stats.observe_draft(num_draft_tokens=3, num_accepted_tokens=2)
++    stats.observe_step(
++        num_forwards=1,
++        num_committed_tokens=4,
++        proposer_latency_seconds=0.012,
++        verification_latency_seconds=0.034,
++    )
++
++    metrics.observe(stats)
++
++    assert metrics.counter_spec_decode_num_draft_tokens[0].increments == [3]
++    assert metrics.counter_spec_decode_num_accepted_tokens[0].increments == [2]
++    assert metrics.counter_spec_decode_num_rejected_tokens[0].increments == [1]
++    assert metrics.gauge_spec_decode_acceptance_rate[0].sets == [pytest.approx(2 / 3)]
++    assert metrics.gauge_spec_decode_effective_tokens_per_forward[0].sets == [4]
++    assert metrics.histogram_spec_decode_proposer_latency[0].observations == [0.012]
++    assert metrics.histogram_spec_decode_verification_latency[0].observations == [0.034]
++
++
++def test_operational_contract_is_present_in_interval_log() -> None:
++    stats = SpecDecodingStats.new(3)
++    stats.observe_draft(num_draft_tokens=3, num_accepted_tokens=2)
++    stats.observe_step(
++        num_forwards=1,
++        num_committed_tokens=4,
++        proposer_latency_seconds=0.012,
++        verification_latency_seconds=0.034,
++    )
++    logging = SpecDecodingLogging()
++    logging.observe(stats)
++    messages: list[str] = []
++
++    logging.log(lambda message, *args: messages.append(message % args))
++
++    assert len(messages) == 1
++    assert "Accepted: 2 tokens" in messages[0]
++    assert "Drafted: 3 tokens" in messages[0]
++    assert "Rejected: 1 tokens" in messages[0]
++    assert "Effective tokens/forward: 4.00" in messages[0]
++    assert "Proposer latency: 0.012000 s" in messages[0]
++    assert "Verification latency: 0.034000 s" in messages[0]
+diff --git a/vllm/config/__init__.py b/vllm/config/__init__.py
+index 69166b703f9a..b494b4814773 100644
+--- a/vllm/config/__init__.py
++++ b/vllm/config/__init__.py
+@@ -39,6 +39,10 @@
+ from vllm.config.reasoning import ReasoningConfig
+ from vllm.config.scheduler import SchedulerConfig
+ from vllm.config.speculative import SpeculativeConfig
++from vllm.config.speculative_capability import (
++    SpeculativeCapability,
++    SpeculativeCapabilityError,
++)
+ from vllm.config.speech_to_text import SpeechToTextConfig, SpeechToTextParams
+ from vllm.config.structured_outputs import StructuredOutputsConfig
+ from vllm.config.utils import (
+@@ -117,6 +121,8 @@
+     "SchedulerConfig",
+     # From vllm.config.speculative
+     "SpeculativeConfig",
++    "SpeculativeCapability",
++    "SpeculativeCapabilityError",
+     # From vllm.config.speech_to_text
+     "SpeechToTextConfig",
+     "SpeechToTextParams",
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 983759bc9a5f..21ada6b1c076 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -11,6 +11,11 @@
+ from vllm.config.kernel import MoEBackend
+ from vllm.config.model import HfOverrides, ModelConfig
+ from vllm.config.parallel import ParallelConfig
++from vllm.config.speculative_capability import (
++    SpeculativeCapability,
++    SpeculativeCapabilityError,
++    resolve_speculative_capability,
++)
+ from vllm.config.utils import config
+ from vllm.logger import init_logger
+ from vllm.transformers_utils.config import get_hf_text_config
+@@ -179,6 +184,8 @@ class SpeculativeConfig:
+     """The configuration of the draft model initialized internal."""
+     draft_parallel_config: SkipValidation[ParallelConfig] = None  # type: ignore
+     """The parallel configuration for the draft model initialized internal."""
++    capability: SkipValidation[SpeculativeCapability] = None  # type: ignore
++    """Resolved checkpoint, platform, and proposer capability contract."""
+ 
+     # Suffix decoding configuration
+     suffix_decoding_max_tree_depth: int = 24
+@@ -581,6 +588,8 @@ def __post_init__(self):
+         # can not be detected, it will be considered as the "draft_model" by
+         # default.
+ 
++        model_was_explicit = self.model is not None
++
+         # infer method from user args
+         # Check if the model field contains a custom module path (e.g., 'pkg.Mod')
+         if (
+@@ -904,6 +913,37 @@ def __post_init__(self):
+                         self.target_parallel_config, self.draft_tensor_parallel_size
+                     )
+                 )
++
++        # Resolve only after method inference has completed. SpeculativeConfig
++        # construction may inspect checkpoint metadata, but accelerator/device
++        # and model-weight allocation happen later, so an unavailable proposer
++        # still fails closed before expensive runtime initialization.
++        from vllm.platforms import current_platform
++
++        platform_name = (
++            getattr(current_platform, "device_name", None)
++            or current_platform.__class__.__name__
++        )
++        target_hf_config = (
++            self.target_model_config.hf_text_config
++            if self.target_model_config is not None
++            else {}
++        )
++        registered_proposers = current_platform.get_speculative_proposer_capabilities()
++        if self.method == "custom_class" and self.model is not None:
++            registered_proposers["custom_class"] = self.model
++        self.capability = resolve_speculative_capability(
++            requested_method=self.method,
++            hf_config=target_hf_config,
++            platform=platform_name,
++            registered_proposers=registered_proposers,
++            enforce_checkpoint_match=(
++                not model_was_explicit and self.target_model_config is not None
++            ),
++        )
++        if self.capability.status == "unavailable":
++            raise SpeculativeCapabilityError(self.capability)
++        logger.info("Resolved speculative capability: %s", self.capability.to_dict())
+         return self
+ 
+     def _validate_suffix_decoding(self):
+diff --git a/vllm/config/speculative_capability.py b/vllm/config/speculative_capability.py
+new file mode 100644
+index 000000000000..ec5603e8ac4b
+--- /dev/null
++++ b/vllm/config/speculative_capability.py
+@@ -0,0 +1,193 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++"""Checkpoint-aware speculative decoding capability negotiation."""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Mapping
++from dataclasses import asdict, dataclass
++from typing import Any, Literal
++
++SpeculativeCapabilityMethod = Literal["none", "mtp", "draft_model", "ngram", "dspark"]
++SpeculativeCapabilityStatus = Literal["disabled", "enabled", "unavailable"]
++
++_DSPARK_MARKERS = (
++    "dspark_block_size",
++    "dspark_noise_token_id",
++    "dspark_target_layer_ids",
++    "dspark_markov_rank",
++)
++_MTP_MARKERS = (
++    "n_predict",
++    "num_nextn_predict_layers",
++    "num_mtp_modules",
++)
++
++
++@dataclass(frozen=True)
++class SpeculativeCapability:
++    """Machine-readable result of speculative capability negotiation."""
++
++    requested_method: SpeculativeCapabilityMethod
++    detected_checkpoint_method: SpeculativeCapabilityMethod
++    resolved_method: SpeculativeCapabilityMethod
++    proposer: str
++    platform: str
++    status: SpeculativeCapabilityStatus
++    missing_capability: str | None = None
++    remediation: str | None = None
++    evidence: tuple[str, ...] = ()
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return a stable JSON-compatible capability payload."""
++        payload = asdict(self)
++        payload["evidence"] = list(self.evidence)
++        return payload
++
++
++class SpeculativeCapabilityError(ValueError):
++    """Raised when requested speculation cannot be enabled safely."""
++
++    def __init__(self, capability: SpeculativeCapability):
++        self.capability = capability
++        super().__init__(
++            "Speculative capability negotiation failed: "
++            + json.dumps(capability.to_dict(), sort_keys=True)
++        )
++
++    def to_dict(self) -> dict[str, Any]:
++        """Return the structured failure payload."""
++        return self.capability.to_dict()
++
++
++def normalize_speculative_method(method: str | None) -> SpeculativeCapabilityMethod:
++    """Map runtime-specific method names to the public capability taxonomy."""
++    if method is None:
++        return "none"
++    if method in {"mtp", "deepseek_mtp", "mimo_mtp"} or method.endswith("_mtp"):
++        return "mtp"
++    if method in {"ngram", "ngram_gpu"}:
++        return "ngram"
++    if method == "dspark":
++        return "dspark"
++    return "draft_model"
++
++
++def detect_checkpoint_speculative_capability(
++    hf_config: Any,
++) -> tuple[SpeculativeCapabilityMethod, tuple[str, ...]]:
++    """Detect embedded speculative modules without using checkpoint names.
++
++    DSpark markers intentionally take precedence over generic MTP counters.
++    Some DSpark checkpoints retain ``num_nextn_predict_layers`` for model
++    compatibility; treating that field as MTP would select the wrong proposer.
++    """
++    config = _config_mapping(hf_config)
++    dspark_evidence = tuple(
++        key for key in _DSPARK_MARKERS if config.get(key) is not None
++    )
++    architectures = tuple(config.get("architectures") or ())
++    if dspark_evidence or any("DSpark" in str(arch) for arch in architectures):
++        architecture_evidence = tuple(
++            f"architecture:{arch}" for arch in architectures if "DSpark" in str(arch)
++        )
++        return "dspark", dspark_evidence + architecture_evidence
++
++    mtp_evidence = tuple(
++        key
++        for key in _MTP_MARKERS
++        if isinstance(config.get(key), int) and config[key] > 0
++    )
++    model_type = str(config.get("model_type") or "")
++    mtp_architectures = tuple(
++        f"architecture:{arch}" for arch in architectures if "MTP" in str(arch)
++    )
++    if model_type.endswith("_mtp"):
++        mtp_evidence += (f"model_type:{model_type}",)
++    if mtp_evidence or mtp_architectures:
++        return "mtp", mtp_evidence + mtp_architectures
++    return "none", ()
++
++
++def resolve_speculative_capability(
++    *,
++    requested_method: str | None,
++    hf_config: Any,
++    platform: str,
++    registered_proposers: Mapping[str, str],
++    enforce_checkpoint_match: bool = True,
++) -> SpeculativeCapability:
++    """Resolve a request against checkpoint and proposer capabilities."""
++    requested = normalize_speculative_method(requested_method)
++    detected, evidence = detect_checkpoint_speculative_capability(hf_config)
++    if requested == "none":
++        return SpeculativeCapability(
++            requested_method="none",
++            detected_checkpoint_method=detected,
++            resolved_method="none",
++            proposer="none",
++            platform=platform,
++            status="disabled",
++            evidence=evidence,
++        )
++
++    # Prefer an exact runtime method registration (for example ``eagle3`` or
++    # ``custom_class``) before falling back to the normalized public family.
++    # This keeps the public taxonomy stable without hiding which proposer the
++    # runtime actually selected.
++    proposer = registered_proposers.get(requested_method or "")
++    if proposer is None:
++        proposer = registered_proposers.get(requested)
++    if proposer is None:
++        return SpeculativeCapability(
++            requested_method=requested,
++            detected_checkpoint_method=detected,
++            resolved_method="none",
++            proposer="none",
++            platform=platform,
++            status="unavailable",
++            missing_capability=f"{platform}:{requested}_proposer",
++            remediation=(
++                f"Install or update the {platform} platform plugin so it registers "
++                f"a {requested} proposer, or choose a supported speculative method."
++            ),
++            evidence=evidence,
++        )
++
++    checkpoint_bound = requested in {"mtp", "dspark"} and enforce_checkpoint_match
++    if checkpoint_bound and detected != requested:
++        return SpeculativeCapability(
++            requested_method=requested,
++            detected_checkpoint_method=detected,
++            resolved_method="none",
++            proposer=proposer,
++            platform=platform,
++            status="unavailable",
++            missing_capability=f"checkpoint:{requested}",
++            remediation=(
++                f"Use method='{detected}' for this checkpoint"
++                if detected != "none"
++                else f"Use a checkpoint with embedded {requested} modules"
++            ),
++            evidence=evidence,
++        )
++
++    return SpeculativeCapability(
++        requested_method=requested,
++        detected_checkpoint_method=detected,
++        resolved_method=requested,
++        proposer=proposer,
++        platform=platform,
++        status="enabled",
++        evidence=evidence,
++    )
++
++
++def _config_mapping(hf_config: Any) -> Mapping[str, Any]:
++    if isinstance(hf_config, Mapping):
++        return hf_config
++    if hasattr(hf_config, "to_dict"):
++        return hf_config.to_dict()
++    return vars(hf_config)
+diff --git a/vllm/config/vllm.py b/vllm/config/vllm.py
+index d75fb9163934..1a41e52a0d29 100644
+--- a/vllm/config/vllm.py
++++ b/vllm/config/vllm.py
+@@ -55,6 +55,7 @@
+ if TYPE_CHECKING:
+     from transformers import PretrainedConfig
+ 
++    from vllm.config.speculative_capability import SpeculativeCapability
+     from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+     from vllm.v1.kv_cache_interface import KVCacheConfig
+ else:
+@@ -522,6 +523,33 @@ def num_speculative_tokens(self) -> int:
+             return self.diffusion_config.canvas_length
+         return 0
+ 
++    @property
++    def speculative_capability(self) -> "SpeculativeCapability":
++        """Return the resolved capability for enabled and disabled engines."""
++        if self.speculative_config is not None:
++            return self.speculative_config.capability
++
++        from vllm.config.speculative_capability import (
++            resolve_speculative_capability,
++        )
++        from vllm.platforms import current_platform
++
++        platform_name = (
++            getattr(current_platform, "device_name", None)
++            or current_platform.__class__.__name__
++        )
++        hf_config = (
++            self.model_config.hf_text_config if self.model_config is not None else {}
++        )
++        return resolve_speculative_capability(
++            requested_method=None,
++            hf_config=hf_config,
++            platform=platform_name,
++            registered_proposers=(
++                current_platform.get_speculative_proposer_capabilities()
++            ),
++        )
++
+     @property
+     def use_v2_model_runner(self) -> bool:
+         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+diff --git a/vllm/entrypoints/openai/engine/protocol.py b/vllm/entrypoints/openai/engine/protocol.py
+index 084d8d429a67..65ba24978c28 100644
+--- a/vllm/entrypoints/openai/engine/protocol.py
++++ b/vllm/entrypoints/openai/engine/protocol.py
+@@ -91,6 +91,7 @@ class ModelCard(OpenAIBaseModel):
+     root: str | None = None
+     parent: str | None = None
+     max_model_len: int | None = None
++    speculative_capability: dict[str, Any] | None = None
+     permission: list[ModelPermission] = Field(default_factory=list)
+ 
+ 
+diff --git a/vllm/entrypoints/openai/models/serving.py b/vllm/entrypoints/openai/models/serving.py
+index b886d92641e7..04b9ff04d192 100644
+--- a/vllm/entrypoints/openai/models/serving.py
++++ b/vllm/entrypoints/openai/models/serving.py
+@@ -4,6 +4,7 @@
+ from asyncio import Lock
+ from collections import defaultdict
+ from http import HTTPStatus
++from typing import Any
+ 
+ from vllm.config import ModelConfig
+ from vllm.engine.protocol import EngineClient
+@@ -39,9 +40,11 @@ def __init__(
+         self,
+         model_config: ModelConfig,
+         base_model_paths: list[BaseModelPath],
++        speculative_capability: dict[str, Any] | None = None,
+     ) -> None:
+         self.model_config = model_config
+         self.base_model_paths = base_model_paths
++        self.speculative_capability = speculative_capability
+         self.lora_requests: dict[str, LoRARequest] = {}
+ 
+     def model_name(self, lora_request: LoRARequest | None = None) -> str:
+@@ -70,6 +73,7 @@ async def show_available_models(self) -> ModelList:
+                     id=base_model.name,
+                     max_model_len=max_model_len,
+                     root=base_model.model_path,
++                    speculative_capability=self.speculative_capability,
+                     permission=[ModelPermission()],
+                 )
+                 for base_model in self.base_model_paths
+@@ -98,9 +102,14 @@ def __init__(
+     ):
+         super().__init__()
+ 
++        capability_payload = engine_client.vllm_config.speculative_capability.to_dict()
++        if not isinstance(capability_payload, dict):
++            capability_payload = None
++
+         self.registry = OpenAIModelRegistry(
+             model_config=engine_client.model_config,
+             base_model_paths=base_model_paths,
++            speculative_capability=capability_payload,
+         )
+ 
+         self.engine_client = engine_client
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 605650525af7..ab2bac75a3da 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -213,6 +213,15 @@ class CudaPlatformBase(Platform):
+         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
+     ]
+ 
++    @classmethod
++    def get_speculative_proposer_capabilities(cls) -> dict[str, str]:
++        """Return portable proposers plus CUDA's DSpark proposer."""
++        capabilities = super().get_speculative_proposer_capabilities()
++        capabilities["dspark"] = (
++            "vllm.v1.worker.gpu.spec_decode.dspark.speculator.DSparkSpeculator"
++        )
++        return capabilities
++
+     @classmethod
+     def import_kernels(cls) -> None:
+         """Import CUDA kernel extensions (_C_stable_libtorch, optional _qutlass_C)."""
+diff --git a/vllm/platforms/interface.py b/vllm/platforms/interface.py
+index ecb9f0f14f66..74abd1732ac4 100644
+--- a/vllm/platforms/interface.py
++++ b/vllm/platforms/interface.py
+@@ -553,6 +553,23 @@ def get_kv_cache_compression_provider_factory(cls) -> str | None:
+         """
+         return None
+ 
++    @classmethod
++    def get_speculative_proposer_capabilities(cls) -> dict[str, str]:
++        """Return proposer identities available before device allocation.
++
++        Out-of-tree platforms inherit the portable proposer set and must
++        explicitly opt in to platform-specific methods such as DSpark. The
++        values are stable, machine-readable identities. Querying this hook
++        must not import model code or initialize an accelerator context.
++        """
++        return {
++            # V1 and V2 use different concrete classes for these portable
++            # families, so expose stable implementation-family identities.
++            "mtp": "builtin:mtp",
++            "draft_model": "builtin:draft_model",
++            "ngram": "builtin:ngram",
++        }
++
+     @classmethod
+     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
+         """
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 015f05e69ae1..3fd497c0fead 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -2079,6 +2079,22 @@ def update_from_output(
+                     )
+             finished_req_ids.clear()
+ 
++        if self.log_stats and model_runner_output.spec_decode_num_forwards > 0:
++            if spec_decoding_stats is None:
++                spec_decoding_stats = SpecDecodingStats.new(self.num_spec_tokens)
++            spec_decoding_stats.observe_step(
++                num_forwards=model_runner_output.spec_decode_num_forwards,
++                num_committed_tokens=sum(
++                    len(token_ids) for token_ids in (sampled_token_ids or [])
++                ),
++                proposer_latency_seconds=(
++                    model_runner_output.spec_decode_proposer_latency_seconds
++                ),
++                verification_latency_seconds=(
++                    model_runner_output.spec_decode_verification_latency_seconds
++                ),
++            )
++
+         if (
+             stats := self.make_stats(
+                 spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats
+diff --git a/vllm/v1/metrics/loggers.py b/vllm/v1/metrics/loggers.py
+index 0ab27359d1b8..dcb54689cfbe 100644
+--- a/vllm/v1/metrics/loggers.py
++++ b/vllm/v1/metrics/loggers.py
+@@ -451,6 +451,7 @@ def __init__(
+             labelnames,
+             per_engine_labelvalues,
+             is_diffusion=vllm_config.model_config.is_diffusion,
++            capability=vllm_config.speculative_capability,
+         )
+         self.kv_connector_prom = self._kv_connector_cls(
+             vllm_config, labelnames, per_engine_labelvalues
+diff --git a/vllm/v1/metrics/ray_wrappers.py b/vllm/v1/metrics/ray_wrappers.py
+index 7e2100546e82..fd3af021b5cc 100644
+--- a/vllm/v1/metrics/ray_wrappers.py
++++ b/vllm/v1/metrics/ray_wrappers.py
+@@ -176,6 +176,8 @@ class RaySpecDecodingProm(SpecDecodingProm):
+     """
+ 
+     _counter_cls = RayCounterWrapper
++    _gauge_cls = RayGaugeWrapper
++    _histogram_cls = RayHistogramWrapper
+ 
+ 
+ class RayKVConnectorProm(KVConnectorProm):
+diff --git a/vllm/v1/outputs.py b/vllm/v1/outputs.py
+index 804fb90a3054..c886e87a26cf 100644
+--- a/vllm/v1/outputs.py
++++ b/vllm/v1/outputs.py
+@@ -274,6 +274,11 @@ class ModelRunnerOutput:
+     # information related to cudagraph execution
+     cudagraph_stats: CUDAGraphStat | None = None
+ 
++    # Host-observed speculative phases for operational latency metrics.
++    spec_decode_proposer_latency_seconds: float = 0.0
++    spec_decode_verification_latency_seconds: float = 0.0
++    spec_decode_num_forwards: int = 0
++
+     # Per-step routed experts data captured by the worker.
+     # ``routing_data`` shape: (num_scheduled_tokens, num_layers,
+     #                         num_experts_per_tok); expert IDs as uint8/uint16.
+diff --git a/vllm/v1/spec_decode/metrics.py b/vllm/v1/spec_decode/metrics.py
+index a3ccfb29e737..94fcea015ea0 100644
+--- a/vllm/v1/spec_decode/metrics.py
++++ b/vllm/v1/spec_decode/metrics.py
+@@ -7,7 +7,7 @@
+ import numpy as np
+ import prometheus_client
+ 
+-from vllm.config import SpeculativeConfig
++from vllm.config import SpeculativeCapability, SpeculativeConfig
+ from vllm.logger import init_logger
+ from vllm.v1.metrics.utils import create_metric_per_engine
+ 
+@@ -27,6 +27,11 @@ class SpecDecodingStats:
+     num_drafts: int = 0
+     num_draft_tokens: int = 0
+     num_accepted_tokens: int = 0
++    num_rejected_tokens: int = 0
++    num_forwards: int = 0
++    num_committed_tokens: int = 0
++    proposer_latency_seconds: float = 0.0
++    verification_latency_seconds: float = 0.0
+     num_accepted_tokens_per_pos: list[int] = field(default_factory=list)
+     num_draft_tokens_per_pos: list[int] = field(default_factory=list)
+ 
+@@ -42,12 +47,27 @@ def observe_draft(self, num_draft_tokens: int, num_accepted_tokens: int):
+         self.num_drafts += 1
+         self.num_draft_tokens += num_draft_tokens
+         self.num_accepted_tokens += num_accepted_tokens
++        self.num_rejected_tokens += num_draft_tokens - num_accepted_tokens
+         assert num_accepted_tokens <= self.num_spec_tokens
+         for i in range(num_accepted_tokens):
+             self.num_accepted_tokens_per_pos[i] += 1
+         for i in range(num_draft_tokens):
+             self.num_draft_tokens_per_pos[i] += 1
+ 
++    def observe_step(
++        self,
++        *,
++        num_forwards: int,
++        num_committed_tokens: int,
++        proposer_latency_seconds: float,
++        verification_latency_seconds: float,
++    ) -> None:
++        """Record host-observed proposer and verification phase metrics."""
++        self.num_forwards += num_forwards
++        self.num_committed_tokens += num_committed_tokens
++        self.proposer_latency_seconds += proposer_latency_seconds
++        self.verification_latency_seconds += verification_latency_seconds
++
+ 
+ class SpecDecodingLogging:
+     """Aggregate and log spec decoding metrics.
+@@ -69,6 +89,10 @@ def reset(self):
+         self.num_draft_tokens: list[int] = []
+         self.num_accepted_tokens: list[int] = []
+         self.accepted_tokens_per_pos_lists: list[list[int]] = []
++        self.num_forwards: list[int] = []
++        self.num_committed_tokens: list[int] = []
++        self.proposer_latency_seconds: list[float] = []
++        self.verification_latency_seconds: list[float] = []
+         self.last_log_time = time.monotonic()
+ 
+     def observe(self, spec_decoding_stats: SpecDecodingStats):
+@@ -78,6 +102,14 @@ def observe(self, spec_decoding_stats: SpecDecodingStats):
+         self.accepted_tokens_per_pos_lists.append(
+             spec_decoding_stats.num_accepted_tokens_per_pos
+         )
++        self.num_forwards.append(spec_decoding_stats.num_forwards)
++        self.num_committed_tokens.append(spec_decoding_stats.num_committed_tokens)
++        self.proposer_latency_seconds.append(
++            spec_decoding_stats.proposer_latency_seconds
++        )
++        self.verification_latency_seconds.append(
++            spec_decoding_stats.verification_latency_seconds
++        )
+ 
+     def log(self, log_fn=logger.info):
+         if not self.num_drafts:
+@@ -85,6 +117,9 @@ def log(self, log_fn=logger.info):
+         num_drafts = np.sum(self.num_drafts)
+         num_draft_tokens = np.sum(self.num_draft_tokens)
+         num_accepted_tokens = np.sum(self.num_accepted_tokens)
++        num_rejected_tokens = num_draft_tokens - num_accepted_tokens
++        num_forwards = np.sum(self.num_forwards)
++        num_committed_tokens = np.sum(self.num_committed_tokens)
+         draft_throughput = 0
+         accepted_throughput = 0
+ 
+@@ -111,10 +146,19 @@ def log(self, log_fn=logger.info):
+         )
+ 
+         # Conventionally, mean acceptance length includes the bonus token
+-        mean_acceptance_length = 1 + (num_accepted_tokens / num_drafts)
++        mean_acceptance_length = (
++            1 + (num_accepted_tokens / num_drafts) if num_drafts > 0 else float("nan")
++        )
++        effective_tokens_per_forward = (
++            num_committed_tokens / num_forwards if num_forwards > 0 else float("nan")
++        )
+ 
+         pos_matrix = np.array(self.accepted_tokens_per_pos_lists)
+-        acceptance_rates = np.sum(pos_matrix, axis=0) / num_drafts
++        acceptance_rates = (
++            np.sum(pos_matrix, axis=0) / num_drafts
++            if num_drafts > 0
++            else np.zeros(pos_matrix.shape[-1] if pos_matrix.ndim > 1 else 0)
++        )
+         rates_str = ", ".join(f"{p:.3f}" for p in acceptance_rates)
+ 
+         log_fn(
+@@ -124,6 +168,10 @@ def log(self, log_fn=logger.info):
+             "Drafted throughput: %.2f tokens/s, "
+             "Accepted: %d tokens, "
+             "Drafted: %d tokens, "
++            "Rejected: %d tokens, "
++            "Effective tokens/forward: %.2f, "
++            "Proposer latency: %.6f s, "
++            "Verification latency: %.6f s, "
+             "Per-position acceptance rate: %s, "
+             "Avg Draft acceptance rate: %.1f%%",
+             mean_acceptance_length,
+@@ -131,6 +179,10 @@ def log(self, log_fn=logger.info):
+             draft_throughput,
+             num_accepted_tokens,
+             num_draft_tokens,
++            num_rejected_tokens,
++            effective_tokens_per_forward,
++            np.sum(self.proposer_latency_seconds),
++            np.sum(self.verification_latency_seconds),
+             rates_str,
+             draft_acceptance_rate,
+         )
+@@ -196,6 +248,8 @@ class SpecDecodingProm:
+     """
+ 
+     _counter_cls = prometheus_client.Counter
++    _gauge_cls = prometheus_client.Gauge
++    _histogram_cls = prometheus_client.Histogram
+ 
+     def __init__(
+         self,
+@@ -203,7 +257,40 @@ def __init__(
+         labelnames: list[str],
+         per_engine_labelvalues: dict[int, list[object]],
+         is_diffusion: bool = False,
++        capability: SpeculativeCapability | None = None,
+     ):
++        if capability is not None:
++            capability_labelnames = labelnames + [
++                "requested_method",
++                "detected_checkpoint_method",
++                "resolved_method",
++                "proposer",
++                "platform",
++                "status",
++            ]
++            capability_values = {
++                idx: values
++                + [
++                    capability.requested_method,
++                    capability.detected_checkpoint_method,
++                    capability.resolved_method,
++                    capability.proposer,
++                    capability.platform,
++                    capability.status,
++                ]
++                for idx, values in per_engine_labelvalues.items()
++            }
++            self.gauge_spec_decode_capability = create_metric_per_engine(
++                self._gauge_cls(
++                    name="vllm:spec_decode_capability",
++                    documentation="Resolved speculative decoding capability.",
++                    labelnames=capability_labelnames,
++                ),
++                capability_values,
++            )
++            for gauge in self.gauge_spec_decode_capability.values():
++                gauge.set(1)
++
+         # Diffusion (dLLM) models reuse the spec-decode counters but expose them
+         # under diffusion-native names; the per-position acceptance vector does
+         # not apply, so it is omitted.
+@@ -229,6 +316,7 @@ def __init__(
+                 ("vllm:spec_decode_num_drafts", "Number of spec decoding drafts."),
+                 ("vllm:spec_decode_num_draft_tokens", "Number of draft tokens."),
+                 ("vllm:spec_decode_num_accepted_tokens", "Number of accepted tokens."),
++                ("vllm:spec_decode_num_rejected_tokens", "Number of rejected tokens."),
+             ]
+ 
+         counters = [
+@@ -243,6 +331,61 @@ def __init__(
+         self.counter_spec_decode_num_drafts = counters[0]
+         self.counter_spec_decode_num_draft_tokens = counters[1]
+         self.counter_spec_decode_num_accepted_tokens = counters[2]
++        self.counter_spec_decode_num_rejected_tokens = (
++            counters[3] if not is_diffusion else None
++        )
++
++        if not is_diffusion:
++            self.gauge_spec_decode_acceptance_rate = create_metric_per_engine(
++                self._gauge_cls(
++                    name="vllm:spec_decode_acceptance_rate",
++                    documentation="Accepted draft token fraction.",
++                    labelnames=labelnames,
++                ),
++                per_engine_labelvalues,
++            )
++            self.gauge_spec_decode_effective_tokens_per_forward = (
++                create_metric_per_engine(
++                    self._gauge_cls(
++                        name="vllm:spec_decode_effective_tokens_per_forward",
++                        documentation=(
++                            "Mean committed tokens per target-model forward."
++                        ),
++                        labelnames=labelnames,
++                    ),
++                    per_engine_labelvalues,
++                )
++            )
++            latency_buckets = (
++                0.0001,
++                0.0005,
++                0.001,
++                0.005,
++                0.01,
++                0.05,
++                0.1,
++                0.5,
++                1.0,
++                5.0,
++            )
++            self.histogram_spec_decode_proposer_latency = create_metric_per_engine(
++                self._histogram_cls(
++                    name="vllm:spec_decode_proposer_latency_seconds",
++                    documentation="Host-observed proposer phase latency.",
++                    labelnames=labelnames,
++                    buckets=latency_buckets,
++                ),
++                per_engine_labelvalues,
++            )
++            self.histogram_spec_decode_verification_latency = create_metric_per_engine(
++                self._histogram_cls(
++                    name="vllm:spec_decode_verification_latency_seconds",
++                    documentation=("Host-observed target verification phase latency."),
++                    labelnames=labelnames,
++                    buckets=latency_buckets,
++                ),
++                per_engine_labelvalues,
++            )
+ 
+         self.counter_spec_decode_num_accepted_tokens_per_pos: dict[
+             int, list[prometheus_client.Counter]
+@@ -275,6 +418,34 @@ def observe(self, spec_decoding_stats: SpecDecodingStats, engine_idx: int = 0):
+         self.counter_spec_decode_num_accepted_tokens[engine_idx].inc(
+             spec_decoding_stats.num_accepted_tokens
+         )
++        if self.counter_spec_decode_num_rejected_tokens is not None:
++            self.counter_spec_decode_num_rejected_tokens[engine_idx].inc(
++                spec_decoding_stats.num_rejected_tokens
++            )
++            acceptance_rate = (
++                spec_decoding_stats.num_accepted_tokens
++                / spec_decoding_stats.num_draft_tokens
++                if spec_decoding_stats.num_draft_tokens
++                else 0.0
++            )
++            self.gauge_spec_decode_acceptance_rate[engine_idx].set(acceptance_rate)
++            effective_tokens = (
++                spec_decoding_stats.num_committed_tokens
++                / spec_decoding_stats.num_forwards
++                if spec_decoding_stats.num_forwards
++                else 0.0
++            )
++            self.gauge_spec_decode_effective_tokens_per_forward[engine_idx].set(
++                effective_tokens
++            )
++            if spec_decoding_stats.proposer_latency_seconds > 0:
++                self.histogram_spec_decode_proposer_latency[engine_idx].observe(
++                    spec_decoding_stats.proposer_latency_seconds
++                )
++            if spec_decoding_stats.verification_latency_seconds > 0:
++                self.histogram_spec_decode_verification_latency[engine_idx].observe(
++                    spec_decoding_stats.verification_latency_seconds
++                )
+         for pos, counter in enumerate(
+             self.counter_spec_decode_num_accepted_tokens_per_pos.get(engine_idx, [])
+         ):
+diff --git a/vllm/v1/worker/gpu/model_runner.py b/vllm/v1/worker/gpu/model_runner.py
+index 04ad8c829935..207dc7faa12c 100644
+--- a/vllm/v1/worker/gpu/model_runner.py
++++ b/vllm/v1/worker/gpu/model_runner.py
+@@ -1314,6 +1314,11 @@ def execute_model(
+         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
+ 
+         # Run model.
++        self._spec_decode_verification_started_at = (
++            time.perf_counter()
++            if self.speculator is not None and not dummy_run
++            else None
++        )
+         if batch_desc.cg_mode == CUDAGraphMode.FULL:
+             # Use explicit cudagraph replay for FULL mode.
+             # NOTE(woosuk): Here, we don't need to pass the input tensors,
+@@ -1422,6 +1427,11 @@ def sample_tokens(
+         sampler_output, num_sampled, num_rejected = self.sample(
+             hidden_states, input_batch, grammar_output
+         )
++        verification_latency_seconds = 0.0
++        if self._spec_decode_verification_started_at is not None:
++            verification_latency_seconds = (
++                time.perf_counter() - self._spec_decode_verification_started_at
++            )
+ 
+         if self.pp_handler is not None:
+             # Broadcast to non-last PP ranks (handles spec decode multi-token).
+@@ -1483,6 +1493,7 @@ def sample_tokens(
+             input_batch.query_start_loc,
+         )
+ 
++        proposer_latency_seconds = 0.0
+         if self.speculator is not None:
+             assert self.sampler is not None
+             # Let the target override the hidden state fed to the drafter
+@@ -1493,6 +1504,7 @@ def sample_tokens(
+             if hasattr(self.model, "get_mtp_target_hidden_states"):
+                 pre_hc_hidden_states = self.model.get_mtp_target_hidden_states()
+                 spec_hidden_states = pre_hc_hidden_states[: hidden_states.shape[0]]  # type: ignore[union-attr]
++            proposer_started_at = time.perf_counter()
+             draft_tokens = self.speculator.propose(
+                 input_batch,
+                 attn_metadata,
+@@ -1507,6 +1519,7 @@ def sample_tokens(
+                 self.sampler.sampling_states.seeds.gpu,
+                 mm_inputs=mm_inputs,
+             )
++            proposer_latency_seconds = time.perf_counter() - proposer_started_at
+             self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
+ 
+         if self.num_speculative_steps > 0:
+@@ -1520,6 +1533,13 @@ def sample_tokens(
+         # Post-step KV connector related operations.
+         kv_connector_output = self.kv_connector.post_forward(finished_req_ids)
+         model_runner_output.kv_connector_output = kv_connector_output
++        model_runner_output.spec_decode_proposer_latency_seconds = (
++            proposer_latency_seconds
++        )
++        model_runner_output.spec_decode_verification_latency_seconds = (
++            verification_latency_seconds
++        )
++        model_runner_output.spec_decode_num_forwards = int(self.speculator is not None)
+ 
+         return async_output
+ 
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3d43bb07d3cb..0a12dbbf7a1f 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4353,6 +4353,10 @@ def execute_model(
+         # When spec decode is enabled, defer connector finalization
+         # (wait_for_save + clear metadata) until after draft model runs.
+         defer_kv_connector_finalize = self.speculative_config is not None
++        self._spec_decode_proposer_latency_seconds = 0.0
++        self._spec_decode_verification_started_at = (
++            time.perf_counter() if self.speculative_config is not None else None
++        )
+         # Update the EPLB meta.
+         if self.eplb_state is not None:
+             self.eplb_state.prepare_forward(
+@@ -4547,6 +4551,7 @@ def sample_tokens(
+ 
+         def propose_draft_token_ids(sampled_token_ids):
+             assert spec_decode_common_attn_metadata is not None
++            started_at = time.perf_counter()
+             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                 self._draft_token_ids = self.propose_draft_token_ids(
+                     scheduler_output,
+@@ -4560,6 +4565,9 @@ def propose_draft_token_ids(sampled_token_ids):
+                     slot_mappings,
+                 )
+                 self._copy_draft_token_ids_to_cpu(scheduler_output)
++            self._spec_decode_proposer_latency_seconds += (
++                time.perf_counter() - started_at
++            )
+ 
+         spec_config = self.speculative_config
+         propose_drafts_after_bookkeeping = False
+@@ -4655,6 +4663,12 @@ def propose_draft_token_ids(sampled_token_ids):
+                 scheduler_output.total_num_scheduled_tokens,
+             )
+ 
++        verification_latency_seconds = 0.0
++        if self._spec_decode_verification_started_at is not None:
++            verification_latency_seconds = (
++                time.perf_counter() - self._spec_decode_verification_started_at
++            )
++
+         if propose_drafts_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+             # tokens on the CPU, so they are run after bookkeeping.
+@@ -4686,6 +4700,11 @@ def propose_draft_token_ids(sampled_token_ids):
+                 else None,
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
++                spec_decode_proposer_latency_seconds=(
++                    self._spec_decode_proposer_latency_seconds
++                ),
++                spec_decode_verification_latency_seconds=(verification_latency_seconds),
++                spec_decode_num_forwards=int(spec_config is not None),
+                 routed_experts=None,
+             )
+ 
+
+From fee8b01ec182b64be3a9800099e794e921a1b146 Mon Sep 17 00:00:00 2001
+From: Jingyuan Tian <49518565+CubeLander@users.noreply.github.com>
+Date: Sat, 15 Aug 2026 12:56:23 +0800
+Subject: [PATCH 2/2] fix(spec-decode): backport DeepSeek V4 DSpark fixes
+ (#240)
+
+Backport the DeepSeek V4 DSpark configuration fixes, preserve target quantization, resolve drafting token IDs fail-closed, and add regression coverage.
+---
+ tests/v1/spec_decode/test_dspark_config.py | 143 +++++++++++++++++++++
+ vllm/config/speculative.py                 |   3 +
+ vllm/models/deepseek_v4/nvidia/dspark.py   |   2 +
+ vllm/v1/spec_decode/llm_base_proposer.py   |  15 ++-
+ vllm/v1/worker/gpu/spec_decode/utils.py    |   8 +-
+ 5 files changed, 162 insertions(+), 9 deletions(-)
+ create mode 100644 tests/v1/spec_decode/test_dspark_config.py
+
+diff --git a/tests/v1/spec_decode/test_dspark_config.py b/tests/v1/spec_decode/test_dspark_config.py
+new file mode 100644
+index 000000000000..7adacc7882c6
+--- /dev/null
++++ b/tests/v1/spec_decode/test_dspark_config.py
+@@ -0,0 +1,143 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from types import SimpleNamespace
++
++import pytest
++
++from vllm.config import ParallelConfig, SpeculativeConfig
++from vllm.models.deepseek_v4.nvidia.dspark import (
++    DSparkDeepseekV4ForCausalLM,
++)
++from vllm.v1.spec_decode.llm_base_proposer import SpecDecodeBaseProposer
++from vllm.v1.worker.gpu.spec_decode.utils import get_parallel_drafting_token_id
++
++
++def _parallel_drafting_proposer(hf_config: object) -> SpecDecodeBaseProposer:
++    proposer = SpecDecodeBaseProposer.__new__(SpecDecodeBaseProposer)
++    proposer.draft_model_config = SimpleNamespace(hf_config=hf_config)
++    proposer.pass_hidden_states_to_model = False
++    return proposer
++
++
++def test_dspark_drafter_uses_target_vocabulary_without_remapping():
++    assert DSparkDeepseekV4ForCausalLM.draft_id_to_target_id is None
++
++
++@pytest.mark.parametrize(
++    ("hf_config", "expected_token_id"),
++    [
++        (
++            SimpleNamespace(
++                dflash_config={"mask_token_id": 11},
++                mask_token_id=12,
++                dspark_noise_token_id=13,
++                pard_token=14,
++                ptd_token_id=15,
++            ),
++            11,
++        ),
++        (
++            SimpleNamespace(
++                mask_token_id=12,
++                dspark_noise_token_id=13,
++                pard_token=14,
++                ptd_token_id=15,
++            ),
++            12,
++        ),
++        (
++            SimpleNamespace(
++                dspark_noise_token_id=13,
++                pard_token=14,
++                ptd_token_id=15,
++            ),
++            13,
++        ),
++        (
++            SimpleNamespace(
++                dflash_config={"mask_token_id": None},
++                mask_token_id=None,
++                dspark_noise_token_id=None,
++                pard_token=14,
++                ptd_token_id=15,
++            ),
++            14,
++        ),
++        (SimpleNamespace(pard_token=14, ptd_token_id=15), 14),
++        (SimpleNamespace(ptd_token_id=15), 15),
++    ],
++)
++def test_parallel_drafting_token_id_precedence(
++    hf_config: SimpleNamespace, expected_token_id: int
++):
++    proposer = _parallel_drafting_proposer(hf_config)
++
++    proposer._init_parallel_drafting_params()
++
++    assert proposer.parallel_drafting_token_id == expected_token_id
++    assert get_parallel_drafting_token_id(hf_config) == expected_token_id
++
++
++def test_parallel_drafting_token_id_requires_supported_configured_id():
++    hf_config = SimpleNamespace(
++        dflash_config={"mask_token_id": None},
++        mask_token_id=None,
++        dspark_noise_token_id=None,
++        pard_token=None,
++        ptd_token_id=None,
++    )
++    proposer = _parallel_drafting_proposer(hf_config)
++
++    with pytest.raises(ValueError, match="dflash_config.mask_token_id.*ptd_token_id"):
++        proposer._init_parallel_drafting_params()
++    with pytest.raises(ValueError, match="dflash_config.mask_token_id.*ptd_token_id"):
++        get_parallel_drafting_token_id(hf_config)
++
++
++def test_dspark_config_inherits_target_quantization(monkeypatch: pytest.MonkeyPatch):
++    target_model_config = SimpleNamespace(
++        model="deepseek-ai/dspark_qwen3_4b_block7",
++        tokenizer="target-tokenizer",
++        tokenizer_mode="auto",
++        trust_remote_code=False,
++        allowed_local_media_path="",
++        allowed_media_domains=None,
++        dtype="auto",
++        seed=0,
++        tokenizer_revision=None,
++        max_model_len=128,
++        quantization="fp8",
++        enforce_eager=True,
++        max_logprobs=20,
++        config_format="hf",
++    )
++    draft_hf_config = SimpleNamespace(
++        model_type="deepseek_v4",
++        architectures=["DeepseekV4ForCausalLM"],
++    )
++    draft_model_config = SimpleNamespace(
++        model=target_model_config.model,
++        hf_config=draft_hf_config,
++        architectures=draft_hf_config.architectures,
++        max_model_len=128,
++        quantization=None,
++        verify_with_parallel_config=lambda _parallel_config: None,
++    )
++
++    def fake_model_config(**kwargs):
++        draft_model_config.quantization = kwargs["quantization"]
++        return draft_model_config
++
++    monkeypatch.setattr("vllm.config.speculative.ModelConfig", fake_model_config)
++    monkeypatch.setattr(SpeculativeConfig, "update_arch_", lambda _self: None)
++
++    speculative_config = SpeculativeConfig(
++        model=target_model_config.model,
++        target_model_config=target_model_config,
++        target_parallel_config=ParallelConfig(),
++        num_speculative_tokens=1,
++    )
++
++    assert speculative_config.method == "dspark"
++    assert speculative_config.draft_model_config.quantization == "fp8"
+diff --git a/vllm/config/speculative.py b/vllm/config/speculative.py
+index 21ada6b1c076..ac9b5994e40f 100644
+--- a/vllm/config/speculative.py
++++ b/vllm/config/speculative.py
+@@ -857,6 +857,9 @@ def __post_init__(self):
+                     self.draft_model_config.hf_config.architectures = [
+                         "DSparkDraftModel"
+                     ]
++                    self.draft_model_config.quantization = (
++                        self.target_model_config.quantization
++                    )
+                     self.update_arch_()
+ 
+                 if self.method in ("dflash", "dspark"):
+diff --git a/vllm/models/deepseek_v4/nvidia/dspark.py b/vllm/models/deepseek_v4/nvidia/dspark.py
+index be4a87b323fe..e4e258372a29 100644
+--- a/vllm/models/deepseek_v4/nvidia/dspark.py
++++ b/vllm/models/deepseek_v4/nvidia/dspark.py
+@@ -269,6 +269,8 @@ class DSparkDeepseekV4ForCausalLM(nn.Module):
+     # load_dspark_model always aliases the target's.
+     has_own_embed_tokens = False
+     has_own_lm_head = False
++    # Full-vocab draft: draft ids are target ids, no remapping needed.
++    draft_id_to_target_id = None
+ 
+     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+         super().__init__()
+diff --git a/vllm/v1/spec_decode/llm_base_proposer.py b/vllm/v1/spec_decode/llm_base_proposer.py
+index 4d27e308e88e..2ecbdd738a43 100644
+--- a/vllm/v1/spec_decode/llm_base_proposer.py
++++ b/vllm/v1/spec_decode/llm_base_proposer.py
+@@ -352,17 +352,22 @@ def _init_parallel_drafting_params(self):
+         model_hf_config = self.draft_model_config.hf_config
+         # DFlash stores mask_token_id in dflash_config
+         dflash_config = getattr(model_hf_config, "dflash_config", None)
+-        if dflash_config and "mask_token_id" in dflash_config:
++        if dflash_config and dflash_config.get("mask_token_id") is not None:
+             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
+-        elif hasattr(model_hf_config, "pard_token"):
++        elif getattr(model_hf_config, "mask_token_id", None) is not None:
++            self.parallel_drafting_token_id = model_hf_config.mask_token_id
++        elif getattr(model_hf_config, "dspark_noise_token_id", None) is not None:
++            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
++        elif getattr(model_hf_config, "pard_token", None) is not None:
+             self.parallel_drafting_token_id = model_hf_config.pard_token
+-        elif hasattr(model_hf_config, "ptd_token_id"):
++        elif getattr(model_hf_config, "ptd_token_id", None) is not None:
+             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
+         else:
+             raise ValueError(
+                 "For parallel drafting, the draft model config must have "
+-                "`pard_token`, `ptd_token_id`, or "
+-                "`dflash_config.mask_token_id` specified in its config.json."
++                "`dflash_config.mask_token_id`, `mask_token_id`, "
++                "`dspark_noise_token_id`, `pard_token`, or `ptd_token_id` "
++                "specified in its config.json."
+             )
+ 
+         if self.pass_hidden_states_to_model:
+diff --git a/vllm/v1/worker/gpu/spec_decode/utils.py b/vllm/v1/worker/gpu/spec_decode/utils.py
+index 37ca1665937e..22bf2b8ee026 100644
+--- a/vllm/v1/worker/gpu/spec_decode/utils.py
++++ b/vllm/v1/worker/gpu/spec_decode/utils.py
+@@ -59,15 +59,15 @@ def get_parallel_drafting_token_id(hf_config) -> int:
+     none are present.
+     """
+     dflash_config = getattr(hf_config, "dflash_config", None) or {}
+-    if "mask_token_id" in dflash_config:
++    if dflash_config.get("mask_token_id") is not None:
+         return int(dflash_config["mask_token_id"])
+     if getattr(hf_config, "mask_token_id", None) is not None:
+         return int(hf_config.mask_token_id)
+-    if hasattr(hf_config, "dspark_noise_token_id"):
++    if getattr(hf_config, "dspark_noise_token_id", None) is not None:
+         return int(hf_config.dspark_noise_token_id)
+-    if hasattr(hf_config, "pard_token"):
++    if getattr(hf_config, "pard_token", None) is not None:
+         return int(hf_config.pard_token)
+-    if hasattr(hf_config, "ptd_token_id"):
++    if getattr(hf_config, "ptd_token_id", None) is not None:
+         return int(hf_config.ptd_token_id)
+     raise ValueError(
+         "Model config must specify `dflash_config.mask_token_id`,"
