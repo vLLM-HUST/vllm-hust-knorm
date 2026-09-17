@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -241,11 +242,19 @@ def _override_full_attention_specs(registry_module: Any) -> list[str]:
 def _install_spec_registration_patch(
     single_type_module: Any, registry_module: Any
 ) -> bool:
-    """P3: wrap ``register_all_kvcache_specs``.
+    """P3: wrap ``register_all_kvcache_specs`` at every binding site.
 
     Manager registration follows :func:`should_activate` — the same
     single source of truth the runner-side guard uses — so the
     half-enabled state of legacy issue #163 cannot recur.
+
+    Two binding sites exist on verified hosts (found on the real
+    910B2 engine): the defining module attribute (resolved lazily by
+    ``KVCacheSpecRegistry._ensure_registered``) AND a top-level
+    ``from … import`` inside ``vllm.v1.engine.core`` whose call at
+    EngineCore construction bypasses a later attribute replacement in
+    the defining module. Both module attributes are wrapped so the
+    engine path and the registry path share one activation decision.
     """
 
     def build(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -269,7 +278,17 @@ def _install_spec_registration_patch(
 
         return register_all_kvcache_specs
 
-    return _wrap(single_type_module, "register_all_kvcache_specs", build)
+    applied = _wrap(single_type_module, "register_all_kvcache_specs", build)
+    # Binding sites that already did ``from … import register_all_kvcache_specs``
+    # before the plugin loaded (e.g. ``vllm.v1.engine.core`` at EngineCore
+    # construction) hold their own reference and bypass the module-attribute
+    # wrap above — rebind every already-imported site too.
+    for module_name, module in list(sys.modules.items()):
+        if module is single_type_module or not module_name.startswith("vllm."):
+            continue
+        if getattr(module, "register_all_kvcache_specs", None) is not None:
+            _wrap(module, "register_all_kvcache_specs", build)
+    return applied
 
 
 def _install_scheduler_score_routing(scheduler_cls: type) -> bool:

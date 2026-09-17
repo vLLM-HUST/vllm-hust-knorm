@@ -247,6 +247,15 @@ def build_fake_host() -> dict[str, Any]:
     host["FullAttentionManager"] = FullAttentionManager
     host["register_all_kvcache_specs"] = register_all_kvcache_specs
 
+    # --- vllm.v1.engine.core --------------------------------------------
+    # Real hosts bind register_all_kvcache_specs with a top-level
+    # import here and call it at EngineCore construction (engine/core.py
+    # line ~59/~266 on the verified builds) — a second binding site the
+    # P3 patch must also cover.
+    engine_core = register_module("vllm.v1.engine.core")
+    engine_core.register_all_kvcache_specs = register_all_kvcache_specs
+    host["engine_core_module"] = engine_core
+
     # --- vllm.v1.core.sched.scheduler -----------------------------------
     sched_mod = register_module("vllm.v1.core.sched.scheduler")
 
