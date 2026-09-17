@@ -14,9 +14,7 @@ import pytest
 from vllm_hust_knorm._version import __version__
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-MANIFEST_PATH = (
-    SRC / "vllm_hust_knorm" / "manifests" / "vllm-hust-extension-v0.2.json"
-)
+MANIFEST_PATH = SRC / "vllm_hust_knorm" / "manifests" / "vllm-hust-extension-v0.2.json"
 EXTENSION_ID = "org.vllm-hust.knorm"
 
 
@@ -46,9 +44,7 @@ class TestManifestFields:
         # stays on the CPU scheduler plane.
         by_id = {c["component_id"]: c for c in manifest["components"]}
         assert by_id["kv-compression-manager"]["permissions"] == []
-        assert by_id["attention-norm-collector"]["permissions"] == [
-            "device_access"
-        ]
+        assert by_id["attention-norm-collector"]["permissions"] == ["device_access"]
 
     def test_implementation_carrier_is_active(self, manifest):
         carriers = manifest["implementation"]
@@ -84,13 +80,12 @@ class TestEntryPointConsistency:
         import tomllib
 
         pyproject = tomllib.loads(
-            (Path(__file__).resolve().parents[1] / "pyproject.toml")
-            .read_text(encoding="utf-8")
+            (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
+                encoding="utf-8"
+            )
         )
         general = pyproject["project"]["entry-points"]["vllm.general_plugins"]
-        bundles = pyproject["project"]["entry-points"][
-            "vllm_hust.extension_bundles"
-        ]
+        bundles = pyproject["project"]["entry-points"]["vllm_hust.extension_bundles"]
         # Runtime hook and manifest locator both present.
         assert general == {
             "vllm-hust-knorm": "vllm_hust_knorm.bootstrap:register_plugins"
@@ -112,9 +107,7 @@ class TestEntryPointConsistency:
             if ep.group == "vllm_hust.extension_bundles"
         ]
         general = [
-            ep
-            for ep in distribution.entry_points
-            if ep.group == "vllm.general_plugins"
+            ep for ep in distribution.entry_points if ep.group == "vllm.general_plugins"
         ]
         assert [ep.name for ep in bundles] == [EXTENSION_ID]
         assert bundles[0].value == "vllm_hust_knorm.manifests"

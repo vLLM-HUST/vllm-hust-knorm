@@ -48,9 +48,7 @@ def num_skipped_tokens(
     if total_blocks <= warmup_blocks:
         return 0
 
-    target_keep_blocks = max(
-        warmup_blocks, math.ceil(total_blocks * compression_ratio)
-    )
+    target_keep_blocks = max(warmup_blocks, math.ceil(total_blocks * compression_ratio))
     evict_blocks = total_blocks - target_keep_blocks
     if evict_blocks <= 0:
         return 0

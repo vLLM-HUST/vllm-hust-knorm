@@ -47,19 +47,15 @@ def test_wheel_and_sdist_ship_the_manifest(tmp_path: Path):
     with zipfile.ZipFile(wheel_path) as wheel:
         names = wheel.namelist()
     assert any(
-        name.endswith("manifests/vllm-hust-extension-v0.2.json")
-        for name in names
+        name.endswith("manifests/vllm-hust-extension-v0.2.json") for name in names
     ), names
-    assert any(
-        name.endswith("manifests/__init__.py") for name in names
-    ), names
+    assert any(name.endswith("manifests/__init__.py") for name in names), names
 
     (sdist_path,) = out.glob("*.tar.gz")
     with tarfile.open(sdist_path) as sdist:
         sdist_names = sdist.getnames()
     assert any(
-        name.endswith("manifests/vllm-hust-extension-v0.2.json")
-        for name in sdist_names
+        name.endswith("manifests/vllm-hust-extension-v0.2.json") for name in sdist_names
     ), sdist_names
 
 
@@ -68,9 +64,7 @@ def test_wheel_metadata_carries_entry_points_and_version(tmp_path: Path):
 
     (wheel_path,) = out.glob("*.whl")
     with zipfile.ZipFile(wheel_path) as wheel:
-        (metadata_name,) = [
-            n for n in wheel.namelist() if n.endswith("METADATA")
-        ]
+        (metadata_name,) = [n for n in wheel.namelist() if n.endswith("METADATA")]
         metadata = wheel.read(metadata_name).decode("utf-8")
         (entry_points_name,) = [
             n for n in wheel.namelist() if n.endswith("entry_points.txt")
@@ -82,6 +76,5 @@ def test_wheel_metadata_carries_entry_points_and_version(tmp_path: Path):
     assert "org.vllm-hust.knorm = vllm_hust_knorm.manifests" in entry_points
     assert "[vllm.general_plugins]" in entry_points
     assert (
-        "vllm-hust-knorm = vllm_hust_knorm.bootstrap:register_plugins"
-        in entry_points
+        "vllm-hust-knorm = vllm_hust_knorm.bootstrap:register_plugins" in entry_points
     )

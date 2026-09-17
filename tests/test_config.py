@@ -67,18 +67,23 @@ class TestShouldActivateMatrix:
     @pytest.mark.parametrize(
         ("enabled", "ratio", "prefix_caching", "expected"),
         [
-            ("1", "0.5", False, True),   # fully active
-            ("1", "0.5", True, False),   # prefix caching blocks
+            ("1", "0.5", False, True),  # fully active
+            ("1", "0.5", True, False),  # prefix caching blocks
             ("1", "1.0", False, False),  # ratio=1.0 blocks
-            ("1", "1.0", True, False),   # both block
+            ("1", "1.0", True, False),  # both block
             ("0", "0.5", False, False),  # disabled
-            ("0", "0.5", True, False),   # disabled + prefix
+            ("0", "0.5", True, False),  # disabled + prefix
             ("0", "1.0", False, False),  # all off
-            ("0", "1.0", True, False),   # all off + prefix
+            ("0", "1.0", True, False),  # all off + prefix
         ],
     )
     def test_matrix(
-        self, clean_knorm_env, monkeypatch, enabled, ratio, prefix_caching,
+        self,
+        clean_knorm_env,
+        monkeypatch,
+        enabled,
+        ratio,
+        prefix_caching,
         expected,
     ):
         monkeypatch.setenv("VLLM_KNORM_ENABLED", enabled)

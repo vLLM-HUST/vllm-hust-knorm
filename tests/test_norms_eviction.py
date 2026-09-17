@@ -89,9 +89,7 @@ class TestNumSkippedTokens:
 
     def test_invalid_inputs_raise(self):
         with pytest.raises(ValueError):
-            num_skipped_tokens(
-                10, block_size=0, warmup_tokens=8, compression_ratio=0.5
-            )
+            num_skipped_tokens(10, block_size=0, warmup_tokens=8, compression_ratio=0.5)
         with pytest.raises(ValueError):
             num_skipped_tokens(
                 10, block_size=16, warmup_tokens=8, compression_ratio=1.5
@@ -161,9 +159,7 @@ class TestPlanBlockEviction:
 class TestManagerAgainstFakeHost:
     """The host-side apply path (uses the fake vllm from conftest)."""
 
-    def test_manager_applies_plan_to_block_table(
-        self, fake_host, monkeypatch
-    ):
+    def test_manager_applies_plan_to_block_table(self, fake_host, monkeypatch):
         import types
 
         from vllm_hust_knorm.adapters.vllm_hust.patches import install_patches

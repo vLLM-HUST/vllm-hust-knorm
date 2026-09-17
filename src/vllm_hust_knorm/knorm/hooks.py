@@ -96,9 +96,7 @@ def collect_knorm_scores(runner: Any, input_batch: Any) -> None:
     num_scheduled = input_batch.num_tokens_no_spec[:num_reqs]
     positions_np = runner.positions[:num_tokens].cpu().numpy()
 
-    block_size = (
-        runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
-    )
+    block_size = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
 
     from .config import KnormConfig
 

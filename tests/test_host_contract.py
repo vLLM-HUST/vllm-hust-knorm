@@ -46,9 +46,7 @@ class TestQueueAndFreeBlocks:
         queue = fake_host["FreeQueue"]()
 
         def block():
-            return types.SimpleNamespace(
-                next_free_block=None, prev_free_block=None
-            )
+            return types.SimpleNamespace(next_free_block=None, prev_free_block=None)
 
         first, second = block(), block()
         queue.append_n([first])
@@ -61,19 +59,13 @@ class TestQueueAndFreeBlocks:
     def test_free_blocks_prepend_reuses_first(self, fake_host):
         install_patches()
         pool = fake_host["BlockPool"]()
-        evicted = types.SimpleNamespace(
-            ref_cnt=1, is_null=False, block_hash=None
-        )
-        cached = types.SimpleNamespace(
-            ref_cnt=1, is_null=False, block_hash="h"
-        )
+        evicted = types.SimpleNamespace(ref_cnt=1, is_null=False, block_hash=None)
+        cached = types.SimpleNamespace(ref_cnt=1, is_null=False, block_hash="h")
 
         pool.free_blocks([evicted], prepend=True)
         assert evicted.ref_cnt == 0
         assert pool.free_block_queue.num_free_blocks == 1
-        assert pool.free_block_queue.fake_free_list_head.next_free_block is (
-            evicted
-        )
+        assert pool.free_block_queue.fake_free_list_head.next_free_block is (evicted)
 
         pool.free_blocks([cached])  # default path still delegates
         assert cached.ref_cnt == 0
@@ -88,9 +80,7 @@ class TestQueueAndFreeBlocks:
 
         block_pool_cls.free_blocks = free_blocks_with_prepend
         install_patches()
-        assert (
-            block_pool_cls.free_blocks is free_blocks_with_prepend
-        )
+        assert block_pool_cls.free_blocks is free_blocks_with_prepend
 
 
 class TestSpecRegistration:
@@ -104,7 +94,7 @@ class TestSpecRegistration:
         ).register_all_kvcache_specs(config)
         return registry.get_manager_class(fake_host["FullAttentionSpec"]())
 
-    def test_knorm_manager_registered_when_active(self, fake_host, monkeypatch):
+    def test_knorm_manager_registered_when_active(self, fake_host, monkeypatch, capsys):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
         monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
@@ -112,10 +102,10 @@ class TestSpecRegistration:
         manager = self.run_registration(fake_host, make_vllm_config(False))
 
         assert manager is get_knorm_manager_class()
+        # Server-side verification relies on this rg-able log marker.
+        assert "knorm-manager-registered" in capsys.readouterr().out
 
-    def test_prefix_caching_keeps_stock_manager_and_warns(
-        self, fake_host, monkeypatch
-    ):
+    def test_prefix_caching_keeps_stock_manager_and_warns(self, fake_host, monkeypatch):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
         monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
@@ -126,9 +116,7 @@ class TestSpecRegistration:
         warnings = fake_host["logger"].warnings
         assert any("prefix caching" in message for message in warnings)
 
-    def test_no_prefix_warning_when_knorm_disabled(
-        self, fake_host, monkeypatch
-    ):
+    def test_no_prefix_warning_when_knorm_disabled(self, fake_host, monkeypatch):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
 
@@ -145,9 +133,7 @@ class TestSpecRegistration:
 
         assert manager is fake_host["FullAttentionManager"]
 
-    def test_full_matrix_agrees_with_should_activate(
-        self, fake_host, monkeypatch
-    ):
+    def test_full_matrix_agrees_with_should_activate(self, fake_host, monkeypatch):
         install_patches()
         from vllm_hust_knorm.knorm.config import should_activate
 
@@ -165,22 +151,22 @@ class TestSpecRegistration:
             monkeypatch.setenv("VLLM_KNORM_ENABLED", enabled)
             monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", ratio)
 
-            manager = self.run_registration(
-                fake_host, make_vllm_config(prefix_caching)
-            )
+            manager = self.run_registration(fake_host, make_vllm_config(prefix_caching))
 
             if should_activate(prefix_caching):
                 assert manager is get_knorm_manager_class(), (
-                    enabled, ratio, prefix_caching,
+                    enabled,
+                    ratio,
+                    prefix_caching,
                 )
             else:
                 assert manager is fake_host["FullAttentionManager"], (
-                    enabled, ratio, prefix_caching,
+                    enabled,
+                    ratio,
+                    prefix_caching,
                 )
 
-    def test_mla_spec_moves_together_with_full_attention(
-        self, fake_host, monkeypatch
-    ):
+    def test_mla_spec_moves_together_with_full_attention(self, fake_host, monkeypatch):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
         registry = fake_host["registry"]
@@ -189,9 +175,7 @@ class TestSpecRegistration:
             "vllm.v1.core.single_type_kv_cache_manager"
         ).register_all_kvcache_specs(make_vllm_config(False))
 
-        manager = registry.get_manager_class(
-            fake_host["MLAAttentionSpec"]()
-        )
+        manager = registry.get_manager_class(fake_host["MLAAttentionSpec"]())
 
         assert manager is get_knorm_manager_class()
 
@@ -200,9 +184,7 @@ class TestSchedulerRouting:
     def test_scores_routed_into_manager_bridge(self, fake_host):
         install_patches()
         scheduler = fake_host["Scheduler"]()
-        output = types.SimpleNamespace(
-            knorm_block_scores={"r1": [(0, 1.0)]}
-        )
+        output = types.SimpleNamespace(knorm_block_scores={"r1": [(0, 1.0)]})
 
         result = scheduler.update_from_output("sched-out", output)
 
@@ -213,9 +195,7 @@ class TestSchedulerRouting:
         install_patches()
         scheduler = fake_host["Scheduler"]()
 
-        result = scheduler.update_from_output(
-            "sched-out", types.SimpleNamespace()
-        )
+        result = scheduler.update_from_output("sched-out", types.SimpleNamespace())
 
         assert result == "host-result"
         assert drain_block_scores() == {}
@@ -224,13 +204,11 @@ class TestSchedulerRouting:
 class TestRunnerPatches:
     def make_runner(self, fake_host, prefix_caching: bool):
         return fake_host["GPUModelRunner"](
-            cache_config=types.SimpleNamespace(
-                enable_prefix_caching=prefix_caching
-            )
+            cache_config=types.SimpleNamespace(enable_prefix_caching=prefix_caching)
         )
 
     def test_active_runner_installs_attention_wrapper(
-        self, fake_host, monkeypatch
+        self, fake_host, monkeypatch, capsys
     ):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
@@ -242,10 +220,10 @@ class TestRunnerPatches:
         from vllm_hust_knorm.knorm import attention_backend
 
         assert attention_backend._original_forward is not None
+        # Server-side verification relies on this rg-able log marker.
+        assert "knorm-wrapper-installed" in capsys.readouterr().out
 
-    def test_inactive_runner_installs_nothing(
-        self, fake_host, monkeypatch
-    ):
+    def test_inactive_runner_installs_nothing(self, fake_host, monkeypatch):
         install_patches()
         monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
 
@@ -266,9 +244,7 @@ class TestRunnerPatches:
         assert runner._knorm_active is False
         assert runner._knorm_wrapper_installed is False
 
-    def test_wrapped_attention_forward_stores_norms(
-        self, fake_host, monkeypatch
-    ):
+    def test_wrapped_attention_forward_stores_norms(self, fake_host, monkeypatch):
         torch = pytest.importorskip("torch")
 
         install_patches()
@@ -278,8 +254,12 @@ class TestRunnerPatches:
         impl = fake_host["AttentionImpl"]()
         key = torch.zeros(3, 2, 4)
         result = impl.forward(
-            layer="l", query=None, key=key, value=None,
-            kv_cache=None, attn_metadata=None,
+            layer="l",
+            query=None,
+            key=key,
+            value=None,
+            kv_cache=None,
+            attn_metadata=None,
         )
 
         assert result == "attn-output"

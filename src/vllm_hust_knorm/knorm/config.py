@@ -48,9 +48,7 @@ def env_enabled() -> bool:
     try:
         return bool(int(raw))
     except ValueError:
-        raise ValueError(
-            f"{ENV_ENABLED} must be '0' or '1', got {raw!r}"
-        ) from None
+        raise ValueError(f"{ENV_ENABLED} must be '0' or '1', got {raw!r}") from None
 
 
 def env_compression_ratio() -> float:
@@ -64,9 +62,7 @@ def env_compression_ratio() -> float:
             f"{ENV_COMPRESSION_RATIO} must be a float in (0, 1], got {raw!r}"
         ) from None
     if not 0 < value <= 1:
-        raise ValueError(
-            f"{ENV_COMPRESSION_RATIO} must be in (0, 1], got {value}"
-        )
+        raise ValueError(f"{ENV_COMPRESSION_RATIO} must be in (0, 1], got {value}")
     return value
 
 
@@ -81,9 +77,7 @@ def env_warmup_tokens() -> int:
             f"{ENV_WARMUP_TOKENS} must be a non-negative integer, got {raw!r}"
         ) from None
     if value < 0:
-        raise ValueError(
-            f"{ENV_WARMUP_TOKENS} must be non-negative, got {value}"
-        )
+        raise ValueError(f"{ENV_WARMUP_TOKENS} must be non-negative, got {value}")
     return value
 
 
@@ -147,11 +141,7 @@ def should_activate(enable_prefix_caching: bool) -> bool:
     - ``compression_ratio < 1.0`` (matches :attr:`KnormConfig.is_active`);
     - prefix caching is disabled (mutually exclusive; PR #134).
     """
-    return (
-        env_enabled()
-        and env_compression_ratio() < 1.0
-        and not enable_prefix_caching
-    )
+    return env_enabled() and env_compression_ratio() < 1.0 and not enable_prefix_caching
 
 
 def keep_target_blocks(

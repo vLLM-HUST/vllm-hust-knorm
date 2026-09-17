@@ -131,9 +131,7 @@ def build_fake_host() -> dict[str, Any]:
 
     class FreeQueue:
         def __init__(self):
-            self.fake_free_list_head = types.SimpleNamespace(
-                next_free_block=None
-            )
+            self.fake_free_list_head = types.SimpleNamespace(next_free_block=None)
             self.num_free_blocks = 0
             self.blocks: list = []
 
@@ -166,9 +164,7 @@ def build_fake_host() -> dict[str, Any]:
             blocks_list = list(ordered_blocks)
             for block in blocks_list:
                 block.ref_cnt -= 1
-            freed = [
-                b for b in blocks_list if b.ref_cnt == 0 and not b.is_null
-            ]
+            freed = [b for b in blocks_list if b.ref_cnt == 0 and not b.is_null]
             if freed:
                 self.free_block_queue.append_n(freed)
             self.freed.append([("append", b) for b in freed])
@@ -184,9 +180,7 @@ def build_fake_host() -> dict[str, Any]:
             self.block_size = kv_cache_spec.block_size
             self.block_pool = block_pool
             self.req_to_blocks: dict[str, list] = {}
-            self._null_block = (
-                block_pool.null_block if block_pool is not None else None
-            )
+            self._null_block = block_pool.null_block if block_pool is not None else None
             self.freed_requests: list[str] = []
 
         def free(self, request_id):
@@ -243,8 +237,18 @@ def build_fake_host() -> dict[str, Any]:
     class AttentionImpl:
         calls: list[dict] = []
 
-        def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                    output=None, output_scale=None, output_block_scale=None):
+        def forward(
+            self,
+            layer,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=None,
+            output_scale=None,
+            output_block_scale=None,
+        ):
             type(self).calls.append({"key": key})
             return "attn-output"
 
@@ -327,7 +331,5 @@ def restore_sys_modules():
 
 def make_vllm_config(enable_prefix_caching: bool):
     return types.SimpleNamespace(
-        cache_config=types.SimpleNamespace(
-            enable_prefix_caching=enable_prefix_caching
-        )
+        cache_config=types.SimpleNamespace(enable_prefix_caching=enable_prefix_caching)
     )

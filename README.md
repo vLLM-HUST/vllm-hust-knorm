@@ -76,9 +76,29 @@ pip uninstall vllm-hust-knorm
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-pytest -q && ruff check .
+pytest -q && ruff check . && ruff format --check .
 ```
 
-See [docs/how-to-run.md](docs/how-to-run.md),
+See [docs/index.md](docs/index.md) for the full documentation index —
+in particular [docs/how-to-run.md](docs/how-to-run.md)（服务器验证
+workflow）、[docs/development.md](docs/development.md)、
 [docs/architecture.md](docs/architecture.md) and
 [docs/packaging-and-release.md](docs/packaging-and-release.md).
+
+## 已验证环境
+
+真机端到端验收 **pending**（按 [docs/how-to-run.md](docs/how-to-run.md)
+的 workflow 执行后回填本表与 [HOST_CONTRACT.md](HOST_CONTRACT.md)）：
+
+| 项目 | 状态 |
+|---|---|
+| 插件版本 | pending |
+| vLLM-HUST commit | pending（静态验证基线 `main@8344e107`） |
+| 设备 / 模型 | pending（目标 910B2） |
+| Knorm 激活标记（manager + wrapper） | pending |
+| 请求 / 生成质量 | pending |
+| matched-baseline 吞吐（≥3 runs） | pending |
+
+当前完成的验证：CPU 全量单测（含模拟宿主的六补丁契约测试）、
+wheel/sdist 构建与内容校验、隔离环境冒烟安装——见 CI。
+

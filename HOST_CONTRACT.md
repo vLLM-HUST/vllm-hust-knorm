@@ -61,3 +61,9 @@ rank 处理）。
   `sample_tokens` 返回对象上，是否被宿主异步管线透传取决于宿主版本；
   真机验收以同步调度为准。
 - 卸载后必须重启进程才能回退（进程内补丁不支持热卸载）。
+- **可观测性标记**（服务器验证依据，见 docs/how-to-run.md §5）：
+  bootstrap 打 `runtime patches registered`；P3 成功重定向打
+  `knorm-manager-registered`；P5 安装包装打
+  `knorm-wrapper-installed`。两个激活标记必须同现，只出现其一即
+  半启用态（legacy issue #163 症状），设计上已被
+  `should_activate` 单一真源排除。

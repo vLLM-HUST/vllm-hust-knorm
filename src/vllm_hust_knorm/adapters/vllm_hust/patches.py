@@ -47,9 +47,7 @@ from ...knorm.config import (
 _PATCHED = "_vllm_hust_knorm_patched"
 
 
-def _wrap(
-    owner: Any, name: str, builder: Callable[[Callable[..., Any]], Any]
-) -> bool:
+def _wrap(owner: Any, name: str, builder: Callable[[Callable[..., Any]], Any]) -> bool:
     """Replace ``owner.name`` with ``builder(original)`` once.
 
     Returns True when this call performed the wrap, False when a
@@ -144,9 +142,7 @@ def _install_free_blocks_prepend(block_pool_cls: type) -> bool:
         return False
 
     @functools.wraps(original)
-    def free_blocks(
-        self: Any, ordered_blocks: Any, prepend: bool = False
-    ) -> None:
+    def free_blocks(self: Any, ordered_blocks: Any, prepend: bool = False) -> None:
         """Free blocks; ``prepend=True`` re-uses them first."""
         if not prepend:
             original(self, ordered_blocks)
@@ -155,9 +151,7 @@ def _install_free_blocks_prepend(block_pool_cls: type) -> bool:
         for block in blocks_list:
             block.ref_cnt -= 1
         freed = [
-            block
-            for block in blocks_list
-            if block.ref_cnt == 0 and not block.is_null
+            block for block in blocks_list if block.ref_cnt == 0 and not block.is_null
         ]
         if freed:
             self.free_block_queue.prependleft_n(freed)
@@ -167,7 +161,7 @@ def _install_free_blocks_prepend(block_pool_cls: type) -> bool:
     return True
 
 
-def _override_full_attention_specs(registry_module: Any) -> None:
+def _override_full_attention_specs(registry_module: Any) -> list[str]:
     """Re-register host full-attention specs with the Knorm manager.
 
     Every spec the host mapped to ``FullAttentionManager`` under the
@@ -175,7 +169,8 @@ def _override_full_attention_specs(registry_module: Any) -> None:
     ``KnormFullAttentionManager``. Re-registration goes through the
     module-private registry dict (pop-then-register) because the public
     ``register`` rejects conflicting updates — the same idiom the
-    legacy host tests used.
+    legacy host tests used. Returns the redirected spec class names
+    (used by the log marker below).
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import FullAttentionSpec
@@ -197,6 +192,7 @@ def _override_full_attention_specs(registry_module: Any) -> None:
             knorm_manager,
             uniform_type_base_spec=FullAttentionSpec,
         )
+    return [spec.__name__ for spec in targets]
 
 
 def _install_spec_registration_patch(
@@ -217,20 +213,20 @@ def _install_spec_registration_patch(
                 return
             prefix_caching = _prefix_caching_enabled(vllm_config)
             if not should_activate(prefix_caching):
-                if (
-                    prefix_caching
-                    and env_enabled()
-                    and env_compression_ratio() < 1
-                ):
+                if prefix_caching and env_enabled() and env_compression_ratio() < 1:
                     _warn_prefix_caching_blocks_knorm()
                 return
-            _override_full_attention_specs(registry_module)
+            redirected = _override_full_attention_specs(registry_module)
+            print(
+                "[vllm-hust-knorm] KnormFullAttentionManager registered "
+                f"for {', '.join(redirected)} "
+                "(log marker: knorm-manager-registered)",
+                flush=True,
+            )
 
         return register_all_kvcache_specs
 
-    return _wrap(
-        single_type_module, "register_all_kvcache_specs", build
-    )
+    return _wrap(single_type_module, "register_all_kvcache_specs", build)
 
 
 def _install_scheduler_score_routing(scheduler_cls: type) -> bool:
@@ -242,9 +238,7 @@ def _install_scheduler_score_routing(scheduler_cls: type) -> bool:
         def update_from_output(
             self: Any, scheduler_output: Any, model_runner_output: Any
         ) -> Any:
-            knorm_scores = getattr(
-                model_runner_output, "knorm_block_scores", None
-            )
+            knorm_scores = getattr(model_runner_output, "knorm_block_scores", None)
             if knorm_scores:
                 submit_block_scores(knorm_scores)
             return original(self, scheduler_output, model_runner_output)
@@ -276,8 +270,13 @@ def _install_runner_init_patch(runner_cls: type) -> bool:
             )
             self._knorm_active = should_activate(prefix_caching)
             if self._knorm_active:
-                install_attention_wrapper()
+                impl = install_attention_wrapper()
                 self._knorm_wrapper_installed = True
+                print(
+                    "[vllm-hust-knorm] attention wrapper installed on "
+                    f"{impl} (log marker: knorm-wrapper-installed)",
+                    flush=True,
+                )
 
         return __init__
 
