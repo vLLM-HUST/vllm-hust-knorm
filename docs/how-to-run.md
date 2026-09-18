@@ -7,6 +7,9 @@
 > 静态/模拟验证与宿主基线约束见 [HOST_CONTRACT.md](../HOST_CONTRACT.md)；
 > 本文档跑通后，把证据（commit、日志摘录、吞吐）回填其"已验证的
 > 宿主基线"一节。
+>
+> **最近一次真机记录：2026-09-18，§10 表格之后。** 新环境先读那节
+> 的宿主栈坑位清单，能省一轮排障。
 
 ## 1. 环境准备
 
@@ -71,6 +74,11 @@ vllm serve /path/to/model \
 
 通过后再去掉 `--enforce-eager` 复跑（Ascend ACL Graph / CUDA Graph
 路径），日志存 `/tmp/vllm-knorm.log`。
+
+> 2026-09-18 真机用过的实配：Qwen2.5-14B-Instruct 单卡 910B2 →
+> `--max-model-len 8192 --gpu-memory-utilization 0.85`（14B 权重下
+> 0.6 会报 `No available memory for the cache blocks`），模型路径用
+> 本地 snapshot，`HF_HUB_OFFLINE=1`。
 
 ## 5. 日志验证（三个标记 + 一条禁项）
 
@@ -172,3 +180,37 @@ Extension manager 路径的 disable/forget 流程见
 | 半启用态（两标记只出现其一） | 理论上不可能（should_activate 单一真源） | 立即停服提 issue，附完整日志与两个 commit（宿主+插件） |
 | 请求输出 token 数异常腰斩 | 压缩质量回归 / early EOS 复发（legacy #163 症状） | 停用并提 issue；用第 8 步协议复现并记录 |
 | `VLLM_KNORM_COMPRESSION_RATIO` 等取值报错 | env 值非法（fail-closed 校验） | 按报错信息修正取值范围（ratio ∈ (0,1]，见 README 表） |
+| `SamplingParams` 导入失败、`vllm.__file__` 为 None | 在 `/root` 等含 `vllm/` 子目录的 cwd 启动，命名空间包遮蔽真宿主 | 换到不含 `vllm/` 子目录的 cwd（如插件仓库目录）再启动 |
+| `Ascend vllm_version_is rejects dev version` 类版本校验失败 | editable 宿主上报 dev 版本，宿主间版本守卫拒绝 | `VLLM_VERSION=0.23.1` 显式钉版本（workaround，需记录） |
+| EngineCore 起爆：`No module named 'triton.experimental.gluon.nvidia'` | **宿主栈自身 bug**：`vllm_ascend/_triton_compat.py` 对 triton <3.6 注入空 gluon stub，而本机 triton-ascend fork 的 jit.py 硬依赖真实 gluon.nvidia。与插件无关（卸载插件复跑同样崩，对照证据在验证记录） | 热修该 shim：`find_spec("triton.experimental.gluon.nvidia")` 命中真实包时 import 真包而非装 stub（12 行 diff，已留在验证机上并回填 git diff）；应上游化 |
+| `No available memory for the cache blocks` | 14B 模型 + 默认 0.9 利用率超出单卡 HBM 余量 | 挑空闲卡（`ASCEND_RT_VISIBLE_DEVICES=2`）+ `--gpu-memory-utilization 0.85` |
+| `knorm-manager-registered` 缺失但 wrapper 已装 | 旧版插件只包裹定义模块属性，被 `vllm.v1.engine.core` 顶层 `from … import` 绑定绕过（真机踩中，fix `495a653`） | 升级插件 ≥ `495a653` |
+| 首次 decode 报 `remove_skipped_blocks() takes 3 positional arguments but 4 were given` | 宿主签名含 `num_prompt_tokens`，旧插件 override 未跟（真机踩中，fix `45e9157`） | 升级插件 ≥ `45e9157` |
+
+## 11. 真机验证记录（2026-09-18，910B2）
+
+环境：`vllm-hust@f18cf803c5`（detached）+ `vllm-ascend-hust@17ed0571d`
+（`sync/upstream-main-20260908-latest`）+ triton-ascend `ef6c29210`，
+conda `vllm-hust-dev`（Python 3.11.15，torch_npu 2.10.0），插件
+editable `45e9157`，模型 Qwen2.5-14B-Instruct BF16 单卡
+（`ASCEND_RT_VISIBLE_DEVICES=2`），`--enforce-eager
+--gpu-memory-utilization 0.85 --max-model-len 8192
+--no-enable-prefix-caching`，`VLLM_VERSION=0.23.1`。
+
+| 实验（日志 `/tmp/vllm-knorm-<tag>.log`） | 结果 |
+|---|---|
+| §2/§7.1 关闭态 `side-effect-free` / `control-off-final` | READY 65s/50s，HTTP 200，仅 bootstrap 标记 ✓ |
+| §3 进程内 `register_plugins()` | `['knorm']`，registry 加载前为空、调用后重定向 ✓ |
+| §4-6 激活态 `verify-sigfix-c`（插件 `45e9157`） | READY 50s，HTTP 200，**三标记同现**（bootstrap / wrapper on `FlashAttentionImpl` / manager×5 spec）✓ |
+| §6 长上下文 6640-token（淘汰路径真实触发） | HTTP 200，摘要答案正确，日志 0 ERROR ✓ |
+| §7.2 prefix 互斥 `control-prefix-final` | HTTP 200，prefix 告警出现，无 manager/wrapper 标记 ✓ |
+| 宿主栈 gluon bug 对照（卸载插件） | 同样崩溃 → 与插件无关，证据闭环 |
+
+过程性修复（均已提交）：`50552f8`（stale namespace 误判）、`15b1cc0`
+（`FreeKVCacheBlockQueue`/原生 `prepend_n` 适配）、`495a653`（engine-core
+顶层绑定绕过 P3）、`45e9157`（`remove_skipped_blocks` 签名跟齐宿主）。
+宿主侧遗留一个**未上游化的临时热修**（`vllm-ascend-hust` 工作树
+`_triton_compat.py` +12 行，`git diff` 可见）：gluon stub 探测真包。
+该热修是本栈任何 serving 的前置条件，验证机上**保留**；换机复验时
+按 §10 表格重放。**未验项**：graph 模式、matched-baseline 吞吐对比、
+多卡、分数透传数值核查、长稳。在这些完成前不发布非 dev 版本。

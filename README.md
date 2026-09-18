@@ -5,12 +5,16 @@ runtime-loadable extension bundle. KNorm (Devoto et al., 2024) evicts
 KV-cache blocks whose keys have high L2 norms — they receive
 disproportionately low attention during decoding, so evicting them
 compresses the cache with minimal quality loss. The implementation is
-pure PyTorch and works on CUDA GPUs and Ascend NPUs.
+pure PyTorch with no device-specific kernels; it has been verified on
+Ascend 910B2 (eager mode) and makes no CUDA-specific assumptions, but
+CUDA hosts are untested.
 
-**Status: experimental (manifest `0.2-experimental`).** The runtime
-integration is verified statically and against a simulated host; NPU
-end-to-end acceptance is pending and recorded in
-[HOST_CONTRACT.md](HOST_CONTRACT.md) before any release.
+**Status: experimental (manifest `0.2-experimental`).** Serving-level
+integration passed end-to-end on a real Ascend 910B2 (2026-09-18, eager
+mode — see the verified-environment table below and
+[HOST_CONTRACT.md](HOST_CONTRACT.md)). Not yet verified: graph mode,
+matched-baseline throughput, multi-card. No non-dev release before
+those pass.
 
 Migrated from the archived vLLM-HUST tree (legacy PRs #76/#134/#214 —
 see [PROVENANCE.md](PROVENANCE.md)); as a plugin it is **opt-in**:
@@ -87,18 +91,23 @@ workflow）、[docs/development.md](docs/development.md)、
 
 ## 已验证环境
 
-真机端到端验收 **pending**（按 [docs/how-to-run.md](docs/how-to-run.md)
-的 workflow 执行后回填本表与 [HOST_CONTRACT.md](HOST_CONTRACT.md)）：
+2026-09-18 真机端到端验收（910B2，eager 模式；证据与日志路径见
+[docs/how-to-run.md](docs/how-to-run.md) §11）：
 
-| 项目 | 状态 |
+| 项目 | 已验证值 |
 |---|---|
-| 插件版本 | pending |
-| vLLM-HUST commit | pending（静态验证基线 `main@8344e107`） |
-| 设备 / 模型 | pending（目标 910B2） |
-| Knorm 激活标记（manager + wrapper） | pending |
-| 请求 / 生成质量 | pending |
-| matched-baseline 吞吐（≥3 runs） | pending |
+| 插件 commit / 安装方式 | `45e9157`，editable（验收发布需换 wheel 重跑） |
+| vLLM-HUST commit | `f18cf803c5`（detached；静态基线 `main@8344e107`） |
+| vLLM-Ascend-HUST / triton-ascend | `17ed0571d`（`sync/upstream-main-20260908-latest`）/ `ef6c29210` |
+| 设备 / 模型 | Ascend 910B2 单卡；Qwen2.5-14B-Instruct BF16 |
+| 关键参数 | `--enforce-eager --gpu-memory-utilization 0.85 --max-model-len 8192 --no-enable-prefix-caching`，`VLLM_VERSION=0.23.1` |
+| 安装无副作用 / 关闭对照 | READY 50s，HTTP 200，仅 bootstrap 标记 ✓ |
+| 激活标记（manager + wrapper 同现） | `knorm-manager-registered`（5 spec）+ `knorm-wrapper-installed` ✓ |
+| 请求 / 淘汰路径 | 短请求 HTTP 200；6640-token 长上下文触发淘汰零错误、摘要正确 ✓ |
+| prefix-caching 互斥对照 | 告警出现、manager 不重定向、HTTP 200 ✓ |
+| matched-baseline 吞吐（≥3 runs） | **pending** |
+| graph 模式 / 多卡 / 长稳 | **pending** |
 
-当前完成的验证：CPU 全量单测（含模拟宿主的六补丁契约测试）、
-wheel/sdist 构建与内容校验、隔离环境冒烟安装——见 CI。
+宿主栈注意事项：该组合需要 `_triton_compat.py` gluon 热修（宿主自身
+bug，与插件无关；对照实验与重放步骤见 how-to-run.md §10）。
 
