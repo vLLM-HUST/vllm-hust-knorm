@@ -209,6 +209,9 @@ editable `45e9157`，模型 Qwen2.5-14B-Instruct BF16 单卡
 过程性修复（均已提交）：`50552f8`（stale namespace 误判）、`15b1cc0`
 （`FreeKVCacheBlockQueue`/原生 `prepend_n` 适配）、`495a653`（engine-core
 顶层绑定绕过 P3）、`45e9157`（`remove_skipped_blocks` 签名跟齐宿主）。
+上表所有实验由仓库内 `scripts/run_experiment.sh`
+（`<tag> <port> [off|on] [noprefix|prefix] [nocurl|curl]`，路径可用
+`MODEL`/`PYTHON_BIN` 覆盖）驱动，日志即 `/tmp/vllm-knorm-<tag>.log`。
 宿主侧遗留一个**未上游化的临时热修**（`vllm-ascend-hust` 工作树
 `_triton_compat.py` +12 行，`git diff` 可见）：gluon stub 探测真包。
 该热修是本栈任何 serving 的前置条件，验证机上**保留**；换机复验时
