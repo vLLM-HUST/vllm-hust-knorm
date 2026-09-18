@@ -1,0 +1,1148 @@
+From 73c1438f02dec47cfe45f494003082c0ef27117c Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <5267690+ShuhaoZhangTony@users.noreply.github.com>
+Date: Mon, 20 Jul 2026 10:57:01 +0800
+Subject: [PATCH 1/2] ci(ascend): isolate inference HTTP probes
+
+Signed-off-by: Shuhao Zhang (Tony) <5267690+ShuhaoZhangTony@users.noreply.github.com>
+---
+ .github/workflows/scripts/e2e_http_request.py |  58 ++++++
+ .../scripts/run_e2e_inference_regression.sh   |  35 ++--
+ .../workflows/scripts/run_e2e_serve_smoke.sh  |  28 +--
+ .../ci/test_ascend_benchmark_script_static.py |  11 +-
+ tests/ci/test_e2e_http_request.py             | 180 ++++++++++++++++++
+ ...linux_ascend_inference_workflows_static.py |  14 +-
+ 6 files changed, 295 insertions(+), 31 deletions(-)
+ create mode 100644 .github/workflows/scripts/e2e_http_request.py
+ create mode 100644 tests/ci/test_e2e_http_request.py
+
+diff --git a/.github/workflows/scripts/e2e_http_request.py b/.github/workflows/scripts/e2e_http_request.py
+new file mode 100644
+index 000000000000..33932d319b78
+--- /dev/null
++++ b/.github/workflows/scripts/e2e_http_request.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Make an HTTP request without depending on the runner's libcurl ABI."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++def parse_header(value: str) -> tuple[str, str]:
++    name, separator, header_value = value.partition(":")
++    if not separator or not name.strip():
++        raise argparse.ArgumentTypeError("headers must use the 'Name: value' form")
++    return name.strip(), header_value.lstrip()
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("url")
++    parser.add_argument("--method", choices=("GET", "POST"), default="GET")
++    parser.add_argument("--header", action="append", default=[], type=parse_header)
++    parser.add_argument("--data")
++    parser.add_argument("--timeout", type=float, default=30.0)
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    parsed_url = urllib.parse.urlsplit(args.url)
++    if parsed_url.scheme not in {"http", "https"}:
++        raise SystemExit("URL scheme must be http or https")
++    if args.timeout <= 0:
++        raise SystemExit("--timeout must be greater than zero")
++
++    data = args.data.encode() if args.data is not None else None
++    request = urllib.request.Request(
++        args.url,
++        data=data,
++        headers=dict(args.header),
++        method=args.method,
++    )
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++    try:
++        with opener.open(request, timeout=args.timeout) as response:
++            sys.stdout.buffer.write(response.read())
++    except (urllib.error.URLError, TimeoutError) as exc:
++        print(f"HTTP request failed: {exc}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/.github/workflows/scripts/run_e2e_inference_regression.sh b/.github/workflows/scripts/run_e2e_inference_regression.sh
+index 3e19859e1d3a..4174e3eb1eb8 100644
+--- a/.github/workflows/scripts/run_e2e_inference_regression.sh
++++ b/.github/workflows/scripts/run_e2e_inference_regression.sh
+@@ -14,6 +14,8 @@ BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-5}
+ SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-regression.log}
+ RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-regression-runtime-ready.log}
+ PYTHON_BIN=${PYTHON_BIN:-python}
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++HTTP_REQUEST_SCRIPT=${E2E_HTTP_REQUEST_SCRIPT:-$SCRIPT_DIR/e2e_http_request.py}
+ VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
+ SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+ ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}
+@@ -21,7 +23,7 @@ DEFAULT_SYSTEM_ASCEND_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_ROOT_HELPER:-/usr/loca
+ REPO_ASCEND_ROOT_HELPER=${REPO_ASCEND_ROOT_HELPER:-$VLLM_ASCEND_HUST_REPO/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh}
+ REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT=${REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT:-$VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh}
+ if [[ -n "${ASCEND_E2E_ROOT_HELPER:-}" ]]; then
+-  ASCEND_E2E_ROOT_HELPER=${ASCEND_E2E_ROOT_HELPER}
++  : # Keep the explicitly configured helper.
+ elif [[ -x "$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER" ]]; then
+   ASCEND_E2E_ROOT_HELPER=$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER
+ else
+@@ -118,7 +120,7 @@ export_sudo_preserved_env_vars() {
+ 
+   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
+     if [[ -n "${!var_name+x}" ]]; then
+-      export "$var_name"
++      export "${var_name?}"
+     fi
+   done
+ }
+@@ -420,29 +422,30 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+   local delay_seconds=${E2E_HTTP_REQUEST_DELAY_SECONDS:-2}
++  local timeout_seconds=${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}
+   local attempt=1
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" --timeout "$timeout_seconds" "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -504,7 +507,9 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" \
++    --timeout "${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}" \
++    "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -523,15 +528,16 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+   "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
++http_with_server_log "vLLM completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+@@ -554,10 +560,11 @@ PY
+ rm -f "$completion_response"
+ 
+ chat_response=$(mktemp)
+-curl_with_server_log "vLLM chat completions request" \
++http_with_server_log "vLLM chat completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/chat/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$chat_response"
+ 
+ "$PYTHON_BIN" - "$chat_response" "$MODEL_NAME" <<'PY'
+diff --git a/.github/workflows/scripts/run_e2e_serve_smoke.sh b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+index 2d9f7129bbb0..5462d3074ac6 100644
+--- a/.github/workflows/scripts/run_e2e_serve_smoke.sh
++++ b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+@@ -12,6 +12,8 @@ PROMPT=${PROMPT:-The capital of France is}
+ SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-smoke.log}
+ RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-smoke-runtime-ready.log}
+ PYTHON_BIN=${PYTHON_BIN:-python}
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++HTTP_REQUEST_SCRIPT=${E2E_HTTP_REQUEST_SCRIPT:-$SCRIPT_DIR/e2e_http_request.py}
+ VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
+ SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+ ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}
+@@ -19,7 +21,7 @@ DEFAULT_SYSTEM_ASCEND_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_ROOT_HELPER:-/usr/loca
+ REPO_ASCEND_ROOT_HELPER=${REPO_ASCEND_ROOT_HELPER:-$VLLM_ASCEND_HUST_REPO/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh}
+ REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT=${REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT:-$VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh}
+ if [[ -n "${ASCEND_E2E_ROOT_HELPER:-}" ]]; then
+-  ASCEND_E2E_ROOT_HELPER=${ASCEND_E2E_ROOT_HELPER}
++  : # Keep the explicitly configured helper.
+ elif [[ -x "$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER" ]]; then
+   ASCEND_E2E_ROOT_HELPER=$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER
+ else
+@@ -115,7 +117,7 @@ export_sudo_preserved_env_vars() {
+ 
+   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
+     if [[ -n "${!var_name+x}" ]]; then
+-      export "$var_name"
++      export "${var_name?}"
+     fi
+   done
+ }
+@@ -417,29 +419,30 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+   local delay_seconds=${E2E_HTTP_REQUEST_DELAY_SECONDS:-2}
++  local timeout_seconds=${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}
+   local attempt=1
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" --timeout "$timeout_seconds" "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -501,7 +504,9 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" \
++    --timeout "${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}" \
++    "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -520,15 +525,16 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+   "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
++http_with_server_log "vLLM completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+diff --git a/tests/ci/test_ascend_benchmark_script_static.py b/tests/ci/test_ascend_benchmark_script_static.py
+index 0989f5101f04..cac164661057 100644
+--- a/tests/ci/test_ascend_benchmark_script_static.py
++++ b/tests/ci/test_ascend_benchmark_script_static.py
+@@ -78,7 +78,7 @@ def test_same_spec_runner_resolves_spec_from_shared_registry():
+     assert '--repo-root "$VLLM_HUST_BENCHMARK_REPO"' in same_spec_block
+ 
+ 
+-def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
++def test_e2e_inference_scripts_use_python_http_probe_with_server_log():
+     for script_name in (
+         "run_e2e_serve_smoke.sh",
+         "run_e2e_inference_regression.sh",
+@@ -86,13 +86,16 @@ def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
+         text = script_text(script_name)
+ 
+         assert "print_server_log_tail() {" in text
+-        assert "curl_with_server_log() {" in text
++        assert "http_with_server_log() {" in text
++        assert "e2e_http_request.py" in text
++        assert '"$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT"' in text
+         assert "E2E_HTTP_REQUEST_ATTEMPTS" in text
++        assert "E2E_HTTP_REQUEST_TIMEOUT_SECONDS" in text
+         assert "else\n      rc=$?\n    fi" in text
+         assert "failed after ${max_attempts} attempts" in text
+-        assert 'done\n\ncurl -fsS "http://$HOST:$PORT/v1/models" >/dev/null' not in text
++        assert "curl -fsS" not in text
+         assert "vLLM models endpoint readiness confirmation" in text
+         assert (
+-            "curl_with_server_log"
++            "http_with_server_log"
+             in text[text.index("completion_response=$(mktemp)") :]
+         )
+diff --git a/tests/ci/test_e2e_http_request.py b/tests/ci/test_e2e_http_request.py
+new file mode 100644
+index 000000000000..25c48edd94c8
+--- /dev/null
++++ b/tests/ci/test_e2e_http_request.py
+@@ -0,0 +1,180 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++SCRIPT_PATH = (
++    Path(__file__).resolve().parents[2]
++    / ".github/workflows/scripts/e2e_http_request.py"
++)
++
++
++class RequestHandler(BaseHTTPRequestHandler):
++    request_body = b""
++    content_type = ""
++
++    def do_GET(self) -> None:
++        if self.path == "/failure":
++            self.send_response(503)
++        else:
++            self.send_response(200)
++        self.end_headers()
++        self.wfile.write(b'{"ready":true}')
++
++    def do_POST(self) -> None:
++        length = int(self.headers["Content-Length"])
++        type(self).request_body = self.rfile.read(length)
++        type(self).content_type = self.headers["Content-Type"]
++        self.send_response(200)
++        self.end_headers()
++        self.wfile.write(b'{"accepted":true}')
++
++    def log_message(self, format: str, *args: object) -> None:
++        pass
++
++
++class ProxyRequestHandler(BaseHTTPRequestHandler):
++    request_count = 0
++
++    def do_GET(self) -> None:
++        type(self).request_count += 1
++        self.send_response(502)
++        self.end_headers()
++
++    def log_message(self, format: str, *args: object) -> None:
++        pass
++
++
++def run_server(
++    handler: type[BaseHTTPRequestHandler] = RequestHandler,
++) -> tuple[ThreadingHTTPServer, threading.Thread]:
++    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    return server, thread
++
++
++def test_request_avoids_broken_curl_under_contaminated_environment(tmp_path: Path):
++    fake_bin = tmp_path / "bin"
++    fake_bin.mkdir()
++    fake_curl = fake_bin / "curl"
++    fake_curl.write_text(
++        "#!/bin/sh\n"
++        "echo 'curl: symbol lookup error: /lib64/libldap.so.2: undefined symbol: "
++        "EVP_md2, version OPENSSL_3.0.0' >&2\n"
++        "exit 127\n",
++        encoding="utf-8",
++    )
++    fake_curl.chmod(0o755)
++
++    contaminated_env = os.environ.copy()
++    contaminated_env["PATH"] = f"{fake_bin}:{contaminated_env['PATH']}"
++    contaminated_env["LD_LIBRARY_PATH"] = str(tmp_path / "conda-lib")
++
++    broken_curl = subprocess.run(
++        ["curl", "--version"],
++        env=contaminated_env,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert broken_curl.returncode == 127
++    assert "EVP_md2" in broken_curl.stderr
++
++    server, thread = run_server()
++    proxy, proxy_thread = run_server(ProxyRequestHandler)
++    proxy_url = f"http://127.0.0.1:{proxy.server_port}"
++    contaminated_env.update(
++        {
++            "ALL_PROXY": proxy_url,
++            "HTTP_PROXY": proxy_url,
++            "HTTPS_PROXY": proxy_url,
++            "NO_PROXY": "",
++            "all_proxy": proxy_url,
++            "http_proxy": proxy_url,
++            "https_proxy": proxy_url,
++            "no_proxy": "",
++        }
++    )
++    ProxyRequestHandler.request_count = 0
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                f"http://127.0.0.1:{server.server_port}/v1/models",
++            ],
++            env=contaminated_env,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++        proxy.shutdown()
++        proxy_thread.join()
++        proxy.server_close()
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == '{"ready":true}'
++    assert ProxyRequestHandler.request_count == 0
++
++
++def test_request_posts_json_body_and_header():
++    server, thread = run_server()
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                "--method",
++                "POST",
++                "--header",
++                "Content-Type: application/json",
++                "--data",
++                '{"prompt":"hello"}',
++                f"http://127.0.0.1:{server.server_port}/v1/completions",
++            ],
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == '{"accepted":true}'
++    assert RequestHandler.request_body == b'{"prompt":"hello"}'
++    assert RequestHandler.content_type == "application/json"
++
++
++def test_request_fails_on_non_success_status():
++    server, thread = run_server()
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                f"http://127.0.0.1:{server.server_port}/failure",
++            ],
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++
++    assert result.returncode == 1
++    assert "HTTP Error 503" in result.stderr
+diff --git a/tests/ci/test_linux_ascend_inference_workflows_static.py b/tests/ci/test_linux_ascend_inference_workflows_static.py
+index e5225f0edf10..aa2fdc804214 100644
+--- a/tests/ci/test_linux_ascend_inference_workflows_static.py
++++ b/tests/ci/test_linux_ascend_inference_workflows_static.py
+@@ -70,8 +70,18 @@ def test_inference_workflows_install_matching_ascend_torch_stack():
+         text = workflow_path.read_text(encoding="utf-8")
+ 
+         assert "Install Ascend torch stack for preflight" in text
+-        assert '"$PYTHON_BIN" -c "import torch, torch_npu;' in text
+-        assert '"$PYTHON_BIN" -m pip install "torch==2.9.0" "torch-npu==2.9.0"' in text
++        assert "bash .github/workflows/scripts/ensure_ascend_torch_stack.sh" in text
++
++    helper_text = (
++        REPO_ROOT / ".github/workflows/scripts/ensure_ascend_torch_stack.sh"
++    ).read_text(encoding="utf-8")
++    assert 'ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"' in helper_text
++    assert (
++        'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"' in helper_text
++    )
++    assert '"torch==$ASCEND_TORCH_VERSION"' in helper_text
++    assert '"torch-npu==$ASCEND_TORCH_NPU_VERSION"' in helper_text
++    assert "import torch\nimport torch_npu" in helper_text
+ 
+ 
+ def test_inference_workflows_disable_backend_autoload_during_install_checks():
+
+From bcbe976a2b243db6ffba12fceee5ed75dbf46293 Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <5267690+ShuhaoZhangTony@users.noreply.github.com>
+Date: Mon, 20 Jul 2026 17:12:43 +0800
+Subject: [PATCH 2/2] ci(ascend): gate smoke tests on free device memory
+
+Signed-off-by: Shuhao Zhang (Tony) <5267690+ShuhaoZhangTony@users.noreply.github.com>
+---
+ .../scripts/ascend_e2e_resource_gate.sh       |  60 ++++
+ .../workflows/scripts/run_e2e_serve_smoke.sh  |  13 +
+ .../scripts/select_ascend_ci_device.py        | 328 ++++++++++++++++++
+ tests/ci/test_ascend_e2e_resource_gate.py     | 130 +++++++
+ 4 files changed, 531 insertions(+)
+ create mode 100644 .github/workflows/scripts/ascend_e2e_resource_gate.sh
+ create mode 100644 .github/workflows/scripts/select_ascend_ci_device.py
+ create mode 100644 tests/ci/test_ascend_e2e_resource_gate.py
+
+diff --git a/.github/workflows/scripts/ascend_e2e_resource_gate.sh b/.github/workflows/scripts/ascend_e2e_resource_gate.sh
+new file mode 100644
+index 000000000000..ee32cc7a19b9
+--- /dev/null
++++ b/.github/workflows/scripts/ascend_e2e_resource_gate.sh
+@@ -0,0 +1,60 @@
++#!/usr/bin/env bash
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++select_ascend_e2e_device() {
++  local workload_name=${1:-Ascend E2E test}
++  local selector=${ASCEND_DEVICE_SELECTOR:?ASCEND_DEVICE_SELECTOR must be set}
++  local min_free_ratio=${GPU_MEMORY_UTILIZATION:-0.92}
++  local candidate_devices=${ASCEND_RT_VISIBLE_DEVICES:-${ASCEND_VISIBLE_DEVICES:-}}
++  local selection_output=""
++  local selector_status=0
++  local status=""
++  local device_id=""
++  local source=""
++  local free_memory_mb=""
++  local total_memory_mb=""
++  local required_free_memory_mb=""
++  local -a selector_args=(
++    --npu-smi-bin "${NPU_SMI_BIN:-npu-smi}"
++    --min-free-ratio "$min_free_ratio"
++    --format tsv
++  )
++
++  if [[ -n "$candidate_devices" ]]; then
++    selector_args+=(--candidate-devices "$candidate_devices")
++  fi
++
++  if selection_output=$("$PYTHON_BIN" "$selector" "${selector_args[@]}"); then
++    selector_status=0
++  else
++    selector_status=$?
++  fi
++
++  IFS=$'\t' read -r status device_id source free_memory_mb \
++    total_memory_mb required_free_memory_mb _ <<<"$selection_output"
++
++  if [[ "$selector_status" -eq 0 ]]; then
++    if [[ "$status" != "selected" || ! "$device_id" =~ ^[0-9]+$ ]]; then
++      echo "Ascend device selector returned an invalid success record: $selection_output" >&2
++      return 1
++    fi
++    unset ASCEND_VISIBLE_DEVICES
++    export ASCEND_RT_VISIBLE_DEVICES="$device_id"
++    export VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE="npu:0"
++    echo "Selected Ascend device $device_id for $workload_name: free=${free_memory_mb}MiB total=${total_memory_mb}MiB required=${required_free_memory_mb}MiB source=$source"
++    return 0
++  fi
++
++  if [[ "$selector_status" -eq 3 && "$status" == "unavailable" ]]; then
++    local message="No healthy single Ascend device meets the ${min_free_ratio} free-HBM ratio required by $workload_name."
++    echo "::error title=Ascend resource gate failed::$message" >&2
++    if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
++      printf '### Ascend resource gate\n\n- Status: failed\n- Reason: %s\n' "$message" >>"$GITHUB_STEP_SUMMARY"
++    fi
++    return 1
++  fi
++
++  echo "Ascend device resource probe failed: ${selection_output:-no structured result}" >&2
++  return 1
++}
+diff --git a/.github/workflows/scripts/run_e2e_serve_smoke.sh b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+index 5462d3074ac6..61e9745d353c 100644
+--- a/.github/workflows/scripts/run_e2e_serve_smoke.sh
++++ b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+@@ -7,6 +7,7 @@ PORT=${PORT:-}
+ DTYPE=${DTYPE:-float32}
+ MAX_MODEL_LEN=${MAX_MODEL_LEN:-512}
+ MAX_NUM_SEQS=${MAX_NUM_SEQS:-2}
++GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
+ MAX_TOKENS=${MAX_TOKENS:-8}
+ PROMPT=${PROMPT:-The capital of France is}
+ SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-smoke.log}
+@@ -14,6 +15,8 @@ RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-smoke-runtime-ready.log}
+ PYTHON_BIN=${PYTHON_BIN:-python}
+ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+ HTTP_REQUEST_SCRIPT=${E2E_HTTP_REQUEST_SCRIPT:-$SCRIPT_DIR/e2e_http_request.py}
++ASCEND_DEVICE_SELECTOR=${ASCEND_DEVICE_SELECTOR:-$SCRIPT_DIR/select_ascend_ci_device.py}
++ASCEND_RESOURCE_GATE_SCRIPT=${ASCEND_RESOURCE_GATE_SCRIPT:-$SCRIPT_DIR/ascend_e2e_resource_gate.sh}
+ VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
+ SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+ ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}
+@@ -44,6 +47,7 @@ SUDO_PRESERVE_ENV_VARS=(
+   ASCEND_VISIBLE_DEVICES
+   ATB_HOME_PATH
+   DTYPE
++  GPU_MEMORY_UTILIZATION
+   HCCL_CONNECT_TIMEOUT
+   HCCL_EXEC_TIMEOUT
+   HF_ENDPOINT
+@@ -373,6 +377,7 @@ start_server() {
+         --dtype "$DTYPE" \
+         --max-model-len "$MAX_MODEL_LEN" \
+         --max-num-seqs "$MAX_NUM_SEQS" \
++        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+         --enforce-eager >"$SERVER_LOG" 2>&1 &
+     fi
+     server_pid=$!
+@@ -388,6 +393,7 @@ start_server() {
+         --dtype "$DTYPE" \
+         --max-model-len "$MAX_MODEL_LEN" \
+         --max-num-seqs "$MAX_NUM_SEQS" \
++        --gpu-memory-utilization "$GPU_MEMORY_UTILIZATION" \
+         --enforce-eager >"$SERVER_LOG" 2>&1 &
+     fi
+     server_pid=$!
+@@ -475,6 +481,13 @@ mkdir -p "$marker_dir"
+ echo "Starting vLLM serve smoke test for $MODEL_NAME"
+ echo "Using smoke test port $PORT"
+ echo "Ascend E2E use sudo: $ASCEND_E2E_USE_SUDO"
++# Bind the runtime-ready probe, tensor preflight, and server to the same card.
++# The selector may use passwordless npu-smi through sudo, but never modifies or
++# terminates workloads already using another device.
++# shellcheck source=/dev/null
++source "$ASCEND_RESOURCE_GATE_SCRIPT"
++select_ascend_e2e_device "vLLM serve smoke test"
++
+ if [[ "$ASCEND_E2E_USE_SUDO" == "1" ]]; then
+   echo "Ascend E2E root helper: $ASCEND_E2E_ROOT_HELPER"
+ fi
+diff --git a/.github/workflows/scripts/select_ascend_ci_device.py b/.github/workflows/scripts/select_ascend_ci_device.py
+new file mode 100644
+index 000000000000..7924dd513b20
+--- /dev/null
++++ b/.github/workflows/scripts/select_ascend_ci_device.py
+@@ -0,0 +1,328 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Select a healthy Ascend device with enough free HBM for a CI workload."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import math
++import os
++import re
++import shutil
++import subprocess
++import sys
++from dataclasses import asdict, dataclass
++from typing import Any
++
++EXIT_PROBE_ERROR = 2
++EXIT_NO_ELIGIBLE_DEVICE = 3
++
++
++@dataclass(frozen=True)
++class DeviceMemory:
++    logical_id: int
++    free_memory_mb: int
++    total_memory_mb: int
++    source: str
++
++    def required_memory_mb(self, min_free_ratio: float) -> int:
++        return math.ceil(self.total_memory_mb * min_free_ratio)
++
++
++def parse_logical_map(mapping_output: str) -> dict[tuple[str, str], int]:
++    logical_map: dict[tuple[str, str], int] = {}
++    for line in mapping_output.splitlines():
++        parts = line.split()
++        if len(parts) < 3:
++            continue
++        npu_id, chip_id, logical_id = parts[:3]
++        if npu_id.isdigit() and chip_id.isdigit() and logical_id.isdigit():
++            logical_map[npu_id, chip_id] = int(logical_id)
++    return logical_map
++
++
++def parse_device_memory(
++    info_output: str,
++    logical_map: dict[tuple[str, str], int],
++) -> list[DeviceMemory]:
++    hbm_usage_pattern = re.compile(r"(\d+)\s*/\s*(\d+)\s*$")
++    devices: list[DeviceMemory] = []
++    current_npu_id: str | None = None
++    current_health: str | None = None
++
++    for raw_line in info_output.splitlines():
++        line = raw_line.strip()
++        if not line.startswith("|"):
++            continue
++
++        parts = [part.strip() for part in line.strip("|").split("|")]
++        if len(parts) < 3:
++            continue
++
++        left_column = parts[0].split()
++        if (
++            len(left_column) >= 2
++            and left_column[0].isdigit()
++            and parts[1]
++            and ":" not in parts[1]
++        ):
++            current_npu_id = left_column[0]
++            current_health = parts[1]
++            continue
++
++        if current_npu_id is None or current_health != "OK":
++            continue
++        if len(left_column) != 1 or not left_column[0].isdigit():
++            continue
++
++        chip_id = left_column[0]
++        logical_id = logical_map.get((current_npu_id, chip_id))
++        source = "logical-map"
++        if logical_id is None:
++            if chip_id != "0":
++                continue
++            logical_id = int(current_npu_id)
++            source = "status-fallback"
++
++        hbm_match = hbm_usage_pattern.search(parts[2])
++        if hbm_match is None:
++            continue
++        used_memory_mb = int(hbm_match.group(1))
++        total_memory_mb = int(hbm_match.group(2))
++        if total_memory_mb <= 0 or used_memory_mb < 0:
++            continue
++        devices.append(
++            DeviceMemory(
++                logical_id=logical_id,
++                free_memory_mb=max(0, total_memory_mb - used_memory_mb),
++                total_memory_mb=total_memory_mb,
++                source=source,
++            )
++        )
++
++    return devices
++
++
++def choose_device(
++    devices: list[DeviceMemory],
++    *,
++    min_free_ratio: float,
++    candidate_devices: set[int] | None = None,
++    selection_attempt: int = 1,
++) -> tuple[DeviceMemory | None, list[DeviceMemory]]:
++    considered = [
++        device
++        for device in devices
++        if candidate_devices is None or device.logical_id in candidate_devices
++    ]
++    considered.sort(
++        key=lambda device: (
++            -device.free_memory_mb,
++            device.logical_id,
++            device.source,
++        )
++    )
++    eligible = [
++        device
++        for device in considered
++        if device.free_memory_mb >= device.required_memory_mb(min_free_ratio)
++    ]
++    if not eligible:
++        return None, considered
++    selected = eligible[(max(1, selection_attempt) - 1) % len(eligible)]
++    return selected, considered
++
++
++def run_npu_smi(
++    npu_smi_bin: str,
++    *args: str,
++) -> subprocess.CompletedProcess[str] | None:
++    clean_env = {
++        "PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
++        "HOME": os.environ.get("HOME", ""),
++        "LANG": os.environ.get("LANG", "C.UTF-8"),
++        "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
++        "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
++    }
++    command = [npu_smi_bin, *args]
++    try:
++        result = subprocess.run(
++            command,
++            check=False,
++            capture_output=True,
++            text=True,
++            timeout=5,
++            env=clean_env,
++        )
++        if result.returncode == 0 or os.geteuid() == 0:
++            return result
++
++        sudo_bin = shutil.which("sudo", path=clean_env["PATH"])
++        if sudo_bin is None:
++            return result
++        sudo_result = subprocess.run(
++            [sudo_bin, "-n", *command],
++            check=False,
++            capture_output=True,
++            text=True,
++            timeout=5,
++            env=clean_env,
++        )
++        return sudo_result if sudo_result.returncode == 0 else result
++    except (OSError, subprocess.SubprocessError) as exc:
++        print(f"npu-smi {' '.join(args)} failed: {exc}", file=sys.stderr)
++        return None
++
++
++def parse_candidate_devices(value: str) -> set[int] | None:
++    if not value.strip():
++        return None
++    candidates: set[int] = set()
++    for item in value.split(","):
++        item = item.strip()
++        if not item.isdigit():
++            raise ValueError(
++                "candidate devices must be a comma-separated list of "
++                f"non-negative integers, got {value!r}"
++            )
++        candidates.add(int(item))
++    return candidates
++
++
++def select_from_system(args: argparse.Namespace) -> tuple[dict[str, Any], int]:
++    mapping_result = run_npu_smi(args.npu_smi_bin, "info", "-m")
++    logical_map = {}
++    if mapping_result is not None and mapping_result.returncode == 0:
++        logical_map = parse_logical_map(mapping_result.stdout)
++
++    info_result = run_npu_smi(args.npu_smi_bin, "info")
++    if info_result is None or info_result.returncode != 0:
++        return (
++            {
++                "status": "probe_error",
++                "reason": "npu_smi_info_failed",
++                "min_free_ratio": args.min_free_ratio,
++                "devices": [],
++            },
++            EXIT_PROBE_ERROR,
++        )
++
++    devices = parse_device_memory(info_result.stdout, logical_map)
++    if not devices:
++        return (
++            {
++                "status": "probe_error",
++                "reason": "no_healthy_device_memory_records",
++                "min_free_ratio": args.min_free_ratio,
++                "devices": [],
++            },
++            EXIT_PROBE_ERROR,
++        )
++
++    try:
++        candidate_devices = parse_candidate_devices(args.candidate_devices)
++    except ValueError as exc:
++        return (
++            {
++                "status": "probe_error",
++                "reason": str(exc),
++                "min_free_ratio": args.min_free_ratio,
++                "devices": [],
++            },
++            EXIT_PROBE_ERROR,
++        )
++
++    selected, considered = choose_device(
++        devices,
++        min_free_ratio=args.min_free_ratio,
++        candidate_devices=candidate_devices,
++        selection_attempt=args.selection_attempt,
++    )
++    device_records = [
++        {
++            **asdict(device),
++            "required_free_memory_mb": device.required_memory_mb(args.min_free_ratio),
++            "eligible": device.free_memory_mb
++            >= device.required_memory_mb(args.min_free_ratio),
++        }
++        for device in considered
++    ]
++    if selected is None:
++        return (
++            {
++                "status": "unavailable",
++                "reason": "no_device_meets_free_memory_requirement",
++                "min_free_ratio": args.min_free_ratio,
++                "devices": device_records,
++            },
++            EXIT_NO_ELIGIBLE_DEVICE,
++        )
++
++    return (
++        {
++            "status": "selected",
++            "device_id": selected.logical_id,
++            "source": selected.source,
++            "free_memory_mb": selected.free_memory_mb,
++            "total_memory_mb": selected.total_memory_mb,
++            "required_free_memory_mb": selected.required_memory_mb(args.min_free_ratio),
++            "min_free_ratio": args.min_free_ratio,
++            "devices": device_records,
++        },
++        0,
++    )
++
++
++def emit_result(result: dict[str, Any], output_format: str) -> None:
++    if output_format == "json":
++        print(json.dumps(result, sort_keys=True))
++        return
++    if result["status"] == "selected":
++        print(
++            "\t".join(
++                str(result[key])
++                for key in (
++                    "status",
++                    "device_id",
++                    "source",
++                    "free_memory_mb",
++                    "total_memory_mb",
++                    "required_free_memory_mb",
++                )
++            )
++        )
++        return
++    print(f"{result['status']}\t-\t-\t-\t-\t-\t{result['reason']}")
++
++
++def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument(
++        "--npu-smi-bin",
++        default=os.environ.get("NPU_SMI_BIN") or shutil.which("npu-smi") or "",
++    )
++    parser.add_argument("--min-free-ratio", type=float, default=0.92)
++    parser.add_argument("--candidate-devices", default="")
++    parser.add_argument("--selection-attempt", type=int, default=1)
++    parser.add_argument("--format", choices=("json", "tsv"), default="json")
++    args = parser.parse_args(argv)
++    if not args.npu_smi_bin:
++        parser.error("npu-smi is not available")
++    if not 0 < args.min_free_ratio <= 1:
++        parser.error("--min-free-ratio must be in the interval (0, 1]")
++    if args.selection_attempt <= 0:
++        parser.error("--selection-attempt must be positive")
++    return args
++
++
++def main(argv: list[str] | None = None) -> int:
++    args = parse_args(argv)
++    result, exit_code = select_from_system(args)
++    emit_result(result, args.format)
++    return exit_code
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/tests/ci/test_ascend_e2e_resource_gate.py b/tests/ci/test_ascend_e2e_resource_gate.py
+new file mode 100644
+index 000000000000..bb77e2e5aac6
+--- /dev/null
++++ b/tests/ci/test_ascend_e2e_resource_gate.py
+@@ -0,0 +1,130 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import importlib.util
++import os
++import subprocess
++import sys
++from pathlib import Path
++
++REPO_ROOT = Path(__file__).resolve().parents[2]
++SCRIPT_DIR = REPO_ROOT / ".github/workflows/scripts"
++SELECTOR_PATH = SCRIPT_DIR / "select_ascend_ci_device.py"
++GATE_PATH = SCRIPT_DIR / "ascend_e2e_resource_gate.sh"
++SMOKE_PATH = SCRIPT_DIR / "run_e2e_serve_smoke.sh"
++
++
++def load_selector_module():
++    spec = importlib.util.spec_from_file_location(
++        "select_ascend_ci_device", SELECTOR_PATH
++    )
++    assert spec is not None and spec.loader is not None
++    module = importlib.util.module_from_spec(spec)
++    sys.modules[spec.name] = module
++    spec.loader.exec_module(module)
++    return module
++
++
++def test_selector_chooses_only_a_device_that_meets_the_memory_gate():
++    selector = load_selector_module()
++    mapping = selector.parse_logical_map("0 0 4 Ascend910B2\n1 0 7 Ascend910B2\n")
++    devices = selector.parse_device_memory(
++        """
++| 0 Ascend 910B2 | OK | 98.0 41 0 / 0 |
++| 0 | 0000:C1:00.0 | 0 0 / 0 62000 / 65536 |
++| 1 Ascend 910B2 | OK | 90.0 35 0 / 0 |
++| 0 | 0000:C2:00.0 | 0 0 / 0 4000 / 65536 |
++""",
++        mapping,
++    )
++
++    selected, considered = selector.choose_device(devices, min_free_ratio=0.92)
++
++    assert [device.logical_id for device in considered] == [7, 4]
++    assert selected is not None
++    assert selected.logical_id == 7
++    assert selected.free_memory_mb == 61536
++
++
++def test_selector_fails_closed_when_no_candidate_has_enough_memory():
++    selector = load_selector_module()
++    devices = [
++        selector.DeviceMemory(0, 4096, 65536, "test"),
++        selector.DeviceMemory(1, 8192, 65536, "test"),
++    ]
++
++    selected, considered = selector.choose_device(
++        devices,
++        min_free_ratio=0.92,
++        candidate_devices={0, 1},
++    )
++
++    assert selected is None
++    assert [device.logical_id for device in considered] == [1, 0]
++
++
++def test_resource_gate_binds_the_selected_physical_device(tmp_path: Path):
++    fake_selector = tmp_path / "selector.py"
++    fake_selector.write_text(
++        "print('selected\\t3\\tlogical-map\\t62000\\t65536\\t60294')\n",
++        encoding="utf-8",
++    )
++    command = f"""
++source {GATE_PATH}
++ASCEND_DEVICE_SELECTOR={fake_selector}
++PYTHON_BIN={sys.executable}
++select_ascend_e2e_device smoke
++printf '%s|%s|%s\\n' "$ASCEND_RT_VISIBLE_DEVICES" \
++  "${{ASCEND_VISIBLE_DEVICES-unset}}" "$VLLM_ASCEND_TORCH_PREFLIGHT_DEVICE"
++"""
++
++    result = subprocess.run(
++        ["bash", "-c", command],
++        check=True,
++        capture_output=True,
++        text=True,
++        env={**os.environ, "ASCEND_VISIBLE_DEVICES": "0,1,2,3"},
++    )
++
++    assert result.stdout.rstrip().endswith("3|unset|npu:0")
++
++
++def test_resource_gate_does_not_turn_unavailable_hardware_into_success(
++    tmp_path: Path,
++):
++    fake_selector = tmp_path / "selector.py"
++    fake_selector.write_text(
++        "import sys\n"
++        "print('unavailable\\t-\\t-\\t-\\t-\\t-\\tno_device')\n"
++        "raise SystemExit(3)\n",
++        encoding="utf-8",
++    )
++    summary = tmp_path / "summary.md"
++    command = f"""
++source {GATE_PATH}
++ASCEND_DEVICE_SELECTOR={fake_selector}
++PYTHON_BIN={sys.executable}
++GITHUB_STEP_SUMMARY={summary}
++select_ascend_e2e_device smoke
++"""
++
++    result = subprocess.run(
++        ["bash", "-c", command], capture_output=True, text=True, check=False
++    )
++
++    assert result.returncode == 1
++    assert "Ascend resource gate failed" in result.stderr
++    assert "Status: failed" in summary.read_text(encoding="utf-8")
++
++
++def test_serve_smoke_selects_before_preflight_and_passes_the_same_ratio():
++    text = SMOKE_PATH.read_text(encoding="utf-8")
++    selection = text.index('select_ascend_e2e_device "vLLM serve smoke test"')
++    sudo_branch = text.index('if [[ "$ASCEND_E2E_USE_SUDO" == "1" ]]; then', selection)
++    preflight = text.index("if ensure_runner_npu_ready; then")
++
++    assert selection < sudo_branch < preflight
++    assert "GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}" in text
++    assert '--gpu-memory-utilization "$GPU_MEMORY_UTILIZATION"' in text
++    assert "ASCEND_RT_VISIBLE_DEVICES" in GATE_PATH.read_text(encoding="utf-8")

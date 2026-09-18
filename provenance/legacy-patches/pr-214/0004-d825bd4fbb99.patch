@@ -1,0 +1,63 @@
+From d825bd4fbb9977402fe2dabefd540c8793c4921d Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Tue, 4 Aug 2026 00:02:33 +0800
+Subject: [PATCH] fix(knorm): resolve mypy type errors in should_activate
+ integration
+
+Add type annotation for full_attention_manager, type: ignore for lambda
+fallback assignments, and None check for ast.unparse argument.
+---
+ tests/ci/test_knorm_runner_static.py         | 3 +++
+ vllm/v1/core/single_type_kv_cache_manager.py | 4 ++--
+ vllm/v1/worker/gpu_model_runner.py           | 2 +-
+ 3 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/tests/ci/test_knorm_runner_static.py b/tests/ci/test_knorm_runner_static.py
+index f866c5095d95..a2c7b37517ff 100644
+--- a/tests/ci/test_knorm_runner_static.py
++++ b/tests/ci/test_knorm_runner_static.py
+@@ -52,6 +52,9 @@ def test_knorm_active_flag_defined_in_init():
+         "_knorm_active must be assigned exactly once in __init__"
+     )
+ 
++    assert active_assigns[0].value is not None, (
++        "_knorm_active assignment must have a value"
++    )
+     src = ast.unparse(active_assigns[0].value)
+     # Must call should_activate (single source of truth), not inline
+     # envs checks that could drift from register_all_kvcache_specs.
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index df2c8de4bb3a..761e2ed1466f 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1509,7 +1509,7 @@ def register_all_kvcache_specs(vllm_config):
+     """Built-in spec registration"""
+     from vllm import envs
+ 
+-    full_attention_manager = FullAttentionManager
++    full_attention_manager: type[FullAttentionManager] = FullAttentionManager
+     prefix_caching_enabled = (
+         vllm_config is not None
+         and vllm_config.cache_config is not None
+@@ -1522,7 +1522,7 @@ def register_all_kvcache_specs(vllm_config):
+     try:
+         from vllm.knorm.config import should_activate as _knorm_should_activate
+     except ImportError:
+-        _knorm_should_activate = lambda _: False  # noqa: E731
++        _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
+ 
+     knorm_compatible = (
+         vllm_config is not None
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 7fdd8bc18cc1..f8104ace929c 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -926,7 +926,7 @@ def __init__(
+                 should_activate as _knorm_should_activate,
+             )
+         except ImportError:
+-            _knorm_should_activate = lambda _: False  # noqa: E731
++            _knorm_should_activate = lambda _: False  # type: ignore[assignment]  # noqa: E731
+         self._knorm_active: bool = bool(
+             _knorm_should_activate(self.cache_config.enable_prefix_caching)
+         )

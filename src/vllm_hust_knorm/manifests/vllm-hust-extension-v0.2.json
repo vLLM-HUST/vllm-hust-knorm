@@ -1,0 +1,68 @@
+{
+  "schema_version": "0.2-experimental",
+  "extension_id": "org.vllm-hust.knorm",
+  "extension_version": "0.1.0",
+  "kind": "in_process_plugin",
+  "host": {
+    "provider": "vllm",
+    "name": "vllm",
+    "version_range": ">=0.23",
+    "api_range": ">=1,<2"
+  },
+  "runtime": {
+    "type": "python",
+    "process_scope": "scheduler",
+    "isolation": "trusted_in_process"
+  },
+  "lifecycle_owner": "vllm",
+  "protocols": [
+    {
+      "name": "vllm.general_plugins",
+      "version_range": null
+    },
+    {
+      "name": "vllm.v1.kv_cache_spec_registry",
+      "version_range": null
+    },
+    {
+      "name": "vllm.v1.worker.gpu_model_runner",
+      "version_range": null
+    }
+  ],
+  "implementation": [
+    {
+      "type": "python_module",
+      "module": "vllm_hust_knorm.bootstrap",
+      "object": "register_plugins",
+      "status": "active"
+    }
+  ],
+  "requires_services": [],
+  "components": [
+    {
+      "component_id": "kv-compression-manager",
+      "contracts": ["vllm.kv_cache.compression.v1"],
+      "execution_planes": ["scheduler", "worker"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm_hust_knorm.knorm.manager:get_knorm_manager_class",
+      "permissions": []
+    },
+    {
+      "component_id": "attention-norm-collector",
+      "contracts": ["vllm.attention.norm_collection.v1"],
+      "execution_planes": ["worker", "device"],
+      "isolation": "trusted_in_process",
+      "implementation_ref": "vllm_hust_knorm.knorm.attention_backend:install_attention_wrapper",
+      "permissions": ["device_access"]
+    }
+  ],
+  "activation": {
+    "entry_points": [],
+    "environment": {
+      "VLLM_KNORM_ENABLED": "1",
+      "VLLM_KNORM_COMPRESSION_RATIO": "0.5",
+      "VLLM_KNORM_WARMUP_TOKENS": "32"
+    },
+    "additional_config": {}
+  }
+}
