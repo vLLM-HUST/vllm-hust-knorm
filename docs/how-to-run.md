@@ -10,6 +10,12 @@
 >
 > **最近一次真机记录：2026-09-18，§10 表格之后。** 新环境先读那节
 > 的宿主栈坑位清单，能省一轮排障。
+>
+> **资格状态（2026-10-07）：** manifest 为 `import_only`，ECPA 会拒绝
+> `enable`；`plan/render` 只生成无变更的 inspect-only 结果，未启用的
+> `run` 保持宿主原生路径。本文仅保留给维护者复现历史证据、修复
+> [issue #3](https://github.com/vLLM-HUST/vllm-hust-knorm/issues/3) 并执行
+> 后续资格验收；手工设置环境变量不代表 ECPA 支持或当前生产资格。
 
 ## 1. 环境准备
 

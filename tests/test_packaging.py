@@ -47,7 +47,7 @@ def test_wheel_and_sdist_ship_the_manifest(tmp_path: Path):
     with zipfile.ZipFile(wheel_path) as wheel:
         names = wheel.namelist()
     assert any(
-        name.endswith("manifests/vllm-hust-extension-v0.2.json") for name in names
+        name.endswith("manifests/vllm-hust-extension-v0.3.json") for name in names
     ), names
     assert any(name.endswith("manifests/__init__.py") for name in names), names
 
@@ -55,7 +55,7 @@ def test_wheel_and_sdist_ship_the_manifest(tmp_path: Path):
     with tarfile.open(sdist_path) as sdist:
         sdist_names = sdist.getnames()
     assert any(
-        name.endswith("manifests/vllm-hust-extension-v0.2.json") for name in sdist_names
+        name.endswith("manifests/vllm-hust-extension-v0.3.json") for name in sdist_names
     ), sdist_names
 
 

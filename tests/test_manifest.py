@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
-"""Manifest 0.2 consistency: fields, IDs, version sync, entry points,
+"""Manifest 0.3 consistency: fields, IDs, version sync, entry points,
 and the guide's rule that discovery must not import implementations."""
 
 from __future__ import annotations
@@ -14,7 +14,7 @@ import pytest
 from vllm_hust_knorm._version import __version__
 
 SRC = Path(__file__).resolve().parents[1] / "src"
-MANIFEST_PATH = SRC / "vllm_hust_knorm" / "manifests" / "vllm-hust-extension-v0.2.json"
+MANIFEST_PATH = SRC / "vllm_hust_knorm" / "manifests" / "vllm-hust-extension-v0.3.json"
 EXTENSION_ID = "org.vllm-hust.knorm"
 
 
@@ -25,7 +25,7 @@ def manifest() -> dict:
 
 class TestManifestFields:
     def test_schema_and_identity(self, manifest):
-        assert manifest["schema_version"] == "0.2-experimental"
+        assert manifest["schema_version"] == "0.3-experimental"
         assert manifest["extension_id"] == EXTENSION_ID
         assert manifest["extension_version"] == __version__
 
@@ -46,16 +46,31 @@ class TestManifestFields:
         assert by_id["kv-compression-manager"]["permissions"] == []
         assert by_id["attention-norm-collector"]["permissions"] == ["device_access"]
 
-    def test_implementation_carrier_is_active(self, manifest):
+    def test_implementation_carrier_fails_closed_until_correctness_gate(self, manifest):
         carriers = manifest["implementation"]
         assert len(carriers) == 1
-        assert carriers[0]["status"] == "active"
+        assert carriers[0]["status"] == "import_only"
         assert carriers[0]["module"] == "vllm_hust_knorm.bootstrap"
         assert carriers[0]["object"] == "register_plugins"
 
     def test_activation_environment_covers_enable_switch(self, manifest):
         environment = manifest["activation"]["environment"]
         assert environment["VLLM_KNORM_ENABLED"] == "1"
+
+    def test_activation_declares_installed_general_plugin(self, manifest):
+        assert manifest["activation"]["entry_points"] == [
+            {"group": "vllm.general_plugins", "name": "vllm-hust-knorm"}
+        ]
+
+    def test_composition_contract_is_fail_closed(self, manifest):
+        assert manifest["requires_extensions"] == []
+        assert manifest["resource_claims"] == [
+            {
+                "resource": "vllm.kv-cache.compression-policy",
+                "scope": "vllm-process",
+                "mode": "exclusive",
+            }
+        ]
 
     def test_requires_services_empty_for_in_process_plugin(self, manifest):
         assert manifest["requires_services"] == []

@@ -9,7 +9,10 @@ pure PyTorch with no device-specific kernels; it has been verified on
 Ascend 910B2 (eager mode) and makes no CUDA-specific assumptions, but
 CUDA hosts are untested.
 
-**Status: experimental (manifest `0.2-experimental`).** Serving-level
+**Status: experimental, inspect-only (manifest `0.3-experimental`).** ECPA
+discovers the installed carrier and its exclusive KV-compression resource, but
+fails closed before activation while the scheduler/worker block-table
+replacement correctness gate in issue #3 remains open. Serving-level
 integration passed end-to-end on a real Ascend 910B2 (2026-09-18, eager
 mode — see the verified-environment table below and
 [HOST_CONTRACT.md](HOST_CONTRACT.md)). Not yet verified: graph mode,
@@ -30,21 +33,22 @@ src/vllm_hust_knorm/
 ├── knorm/                  config / norms / eviction（纯逻辑，CPU 可测）
 │   ├── attention_backend / hooks / manager（torch 与宿主路径，惰性导入）
 ├── adapters/vllm_hust/     六个幂等宿主补丁（见 HOST_CONTRACT.md）
-└── manifests/              vllm-hust-extension-v0.2.json
+└── manifests/              vllm-hust-extension-v0.3.json
 provenance/legacy-patches/  三个 legacy PR 的逐 commit patch 存档
 ```
 
-## Quick start
+## ECPA inspection (current supported posture)
 
 ```bash
 pip install vllm-hust-knorm vllm-hust-ext
 vllm-hust-ext extension list                      # org.vllm-hust.knorm
-vllm-hust-ext extension enable org.vllm-hust.knorm
-vllm-hust-ext run --dry-run -- vllm serve MODEL --no-enable-prefix-caching
-vllm-hust-ext run -- vllm serve MODEL --no-enable-prefix-caching
+vllm-hust-ext extension inspect org.vllm-hust.knorm
+vllm-hust-ext extension check org.vllm-hust.knorm
+# enable is rejected; plan/render remain non-mutating inspect-only output
+# a manager run with KNorm disabled follows the native path without injection
 ```
 
-Without the extension manager:
+Developer-only reproduction outside ECPA qualification:
 
 ```bash
 pip install vllm-hust-knorm
@@ -55,6 +59,11 @@ VLLM_KNORM_ENABLED=1 VLLM_KNORM_COMPRESSION_RATIO=0.5 \
 Prefix caching and KNorm are mutually exclusive (legacy PR #134): with
 `--enable-prefix-caching` the plugin keeps the stock
 `FullAttentionManager` and logs a warning.
+
+The manual environment-variable path bypasses ECPA's compatibility and
+resource-conflict gates. It is retained for reproducing the historical device
+evidence below; it is not a supported activation path while the manifest is
+`import_only`.
 
 ### Configuration
 

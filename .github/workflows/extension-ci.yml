@@ -42,7 +42,7 @@ jobs:
           assert im.version("vllm-hust-knorm") == vllm_hust_knorm.__version__
           manifest = json.loads(
               (pathlib.Path(m.__file__).parent
-               / "vllm-hust-extension-v0.2.json").read_text()
+               / "vllm-hust-extension-v0.3.json").read_text()
           )
           assert manifest["extension_id"] == "org.vllm-hust.knorm"
           assert manifest["extension_version"] == vllm_hust_knorm.__version__
@@ -61,13 +61,59 @@ jobs:
           python - <<'PY'
           import json
           p = json.load(open(
-              "src/vllm_hust_knorm/manifests/vllm-hust-extension-v0.2.json"
+              "src/vllm_hust_knorm/manifests/vllm-hust-extension-v0.3.json"
           ))
-          assert p["schema_version"] == "0.2-experimental"
+          assert p["schema_version"] == "0.3-experimental"
           assert p["extension_id"] == "org.vllm-hust.knorm"
           assert p["host"] == {"provider": "vllm", "name": "vllm",
                                "version_range": ">=0.23",
                                "api_range": ">=1,<2"}
           assert len(p["components"]) == 2
+          assert p["implementation"][0]["status"] == "import_only"
+          assert p["activation"]["entry_points"] == [
+              {"group": "vllm.general_plugins", "name": "vllm-hust-knorm"}
+          ]
+          assert p["resource_claims"] == [{
+              "resource": "vllm.kv-cache.compression-policy",
+              "scope": "vllm-process",
+              "mode": "exclusive",
+          }]
           print("manifest OK")
           PY
+      - name: Check clean-wheel ECPA posture
+        if: matrix.python == '3.12'
+        run: |
+          git clone --filter=blob:none \
+            https://github.com/vLLM-HUST/extension-manager.git .ecpa-manager
+          git -C .ecpa-manager checkout \
+            98903e416bdb593186b8245fd95180dafde995b9
+          python -m build --wheel --outdir .ecpa-dist .ecpa-manager
+          python -m venv .ecpa-smoke
+          .ecpa-smoke/bin/python -m pip install --no-cache-dir \
+            .ecpa-dist/vllm_hust_ext-*.whl dist/vllm_hust_knorm-*.whl
+          export XDG_CONFIG_HOME="$PWD/.ecpa-state/config"
+          export XDG_STATE_HOME="$PWD/.ecpa-state/state"
+          export XDG_CACHE_HOME="$PWD/.ecpa-state/cache"
+          .ecpa-smoke/bin/vllm-hust-ext extension list \
+            | grep 'org.vllm-hust.knorm 0.1.0 disabled'
+          .ecpa-smoke/bin/vllm-hust-ext extension inspect \
+            org.vllm-hust.knorm | grep '"activation_ready": false'
+          .ecpa-smoke/bin/vllm-hust-ext extension validate \
+            org.vllm-hust.knorm >/dev/null
+          .ecpa-smoke/bin/vllm-hust-ext extension check \
+            org.vllm-hust.knorm | grep '"degraded"'
+          if .ecpa-smoke/bin/vllm-hust-ext extension enable \
+              org.vllm-hust.knorm; then
+            echo 'import_only extension was unexpectedly enabled' >&2
+            exit 1
+          fi
+          .ecpa-smoke/bin/vllm-hust-ext extension plan \
+            org.vllm-hust.knorm | grep '"operation": "inspect_only"'
+          .ecpa-smoke/bin/vllm-hust-ext extension render \
+            org.vllm-hust.knorm | grep '\\"operation\\": \\"inspect_only\\"'
+          .ecpa-smoke/bin/vllm-hust-ext run --dry-run -- python -c pass \
+            >.ecpa-run.json
+          if grep -q 'VLLM_KNORM_' .ecpa-run.json; then
+            echo 'disabled extension unexpectedly injected activation state' >&2
+            exit 1
+          fi

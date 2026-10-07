@@ -1,5 +1,5 @@
 {
-  "schema_version": "0.2-experimental",
+  "schema_version": "0.3-experimental",
   "extension_id": "org.vllm-hust.knorm",
   "extension_version": "0.1.0",
   "kind": "in_process_plugin",
@@ -34,10 +34,18 @@
       "type": "python_module",
       "module": "vllm_hust_knorm.bootstrap",
       "object": "register_plugins",
-      "status": "active"
+      "status": "import_only"
     }
   ],
   "requires_services": [],
+  "requires_extensions": [],
+  "resource_claims": [
+    {
+      "resource": "vllm.kv-cache.compression-policy",
+      "scope": "vllm-process",
+      "mode": "exclusive"
+    }
+  ],
   "components": [
     {
       "component_id": "kv-compression-manager",
@@ -57,7 +65,12 @@
     }
   ],
   "activation": {
-    "entry_points": [],
+    "entry_points": [
+      {
+        "group": "vllm.general_plugins",
+        "name": "vllm-hust-knorm"
+      }
+    ],
     "environment": {
       "VLLM_KNORM_ENABLED": "1",
       "VLLM_KNORM_COMPRESSION_RATIO": "0.5",

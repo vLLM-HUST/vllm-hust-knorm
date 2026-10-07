@@ -8,6 +8,11 @@ manifest 宿主标识为：
           "api_range": ">=1,<2"}}
 ```
 
+当前 ECPA manifest 状态为 `import_only`：下述宿主表面和历史真机证据供
+检查与后续资格验收使用，但 ECPA 会在 `enable` 之前明确拒绝激活，直到
+[issue #3](https://github.com/vLLM-HUST/vllm-hust-knorm/issues/3) 的
+scheduler/worker block-table replacement 正确性问题关闭并重新完成原生验收。
+
 ## 宿主表面（六个幂等补丁的挂接点）
 
 插件经 `vllm.general_plugins` 在**每个进程**（process 0、engine core、
@@ -72,8 +77,8 @@ P1/P2 自动跳过（fix `15b1cc0`）。
 ## 行为边界
 
 - 安装 ≠ 启用：`VLLM_KNORM_ENABLED` 插件侧默认 `0`（与树内模块默认
-  `1` 的差异是刻意的插件姿态）；manifest 的
-  `activation.environment` 由 `vllm-hust-ext run` 注入。
+  `1` 的差异是刻意的插件姿态）。当前 `import_only` manifest 不允许
+  ECPA 注入激活环境；未来只有在资格门关闭后才可恢复该启动路径。
 - prefix caching 与 Knorm 互斥（PR #134）：开启时保持宿主原生
   manager 并 `warning_once`。
 - 异步调度（async scheduling）路径为尽力而为：分数附着在

@@ -17,7 +17,7 @@ python -m build --no-isolation            # 构建 wheel + sdist（纯 Python）
 bash scripts/verify-wheel.sh dist/*.whl   # wheel 内容/清单/entry point 校验
 ```
 
-CI（`.github/extension-ci.yml`，push main / PR 触发）：Python
+CI（`.github/workflows/extension-ci.yml`，push main / PR 触发）：Python
 3.10 / 3.12 / 3.14 矩阵，依次跑 `ruff check` → `ruff format
 --check` → `pytest -q` → `build` → `verify-wheel.sh` → 隔离 venv
 冒烟安装 → manifest 校验。**CI 没有 NPU 阶段**——设备验证在授权
@@ -40,7 +40,7 @@ src/vllm_hust_knorm/
 │   ├── base.py               # HostAdapter（宿主 import 只在方法内）
 │   └── vllm_hust/patches.py  # 六个幂等宿主补丁 P1–P6（见 HOST_CONTRACT.md）
 ├── bootstrap.py              # vllm.general_plugins 钩子（无宿主时 no-op）
-├── manifests/                # vllm-hust-extension-v0.2.json（发现用，import 安全）
+├── manifests/                # vllm-hust-extension-v0.3.json（发现用，import 安全）
 └── _version.py               # 唯一版本源（与 manifest extension_version 同值）
 ```
 

@@ -19,7 +19,7 @@ for required in \
   'vllm_hust_knorm/adapters/vllm_hust/patches.py' \
   'vllm_hust_knorm/knorm/manager.py' \
   'vllm_hust_knorm/manifests/__init__.py' \
-  'vllm_hust_knorm/manifests/vllm-hust-extension-v0.2.json' \
+  'vllm_hust_knorm/manifests/vllm-hust-extension-v0.3.json' \
   '.dist-info/entry_points.txt' \
   '.dist-info/METADATA'; do
   grep -q "$required" <<<"$entries" || {
