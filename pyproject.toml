@@ -24,7 +24,14 @@ classifiers = [
 [project.optional-dependencies]
 # setuptools is needed for the in-test `python -m build --no-isolation`
 # packaging gates (test_packaging.py).
-dev = ["pytest>=8", "ruff>=0.12", "build>=1.2", "setuptools>=68", "wheel"]
+dev = [
+  "pytest>=8",
+  "ruff>=0.12",
+  "build>=1.2",
+  "setuptools>=68",
+  "tomli>=2; python_version < '3.11'",
+  "wheel",
+]
 
 # Runtime plugin hook. vLLM calls it in every process during plugin
 # loading; registration installs the patches, VLLM_KNORM_ENABLED=1 is

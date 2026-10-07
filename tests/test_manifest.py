@@ -92,7 +92,10 @@ class TestManifestFields:
 
 class TestEntryPointConsistency:
     def test_pyproject_declares_both_entry_points(self):
-        import tomllib
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - Python 3.10
+            import tomli as tomllib
 
         pyproject = tomllib.loads(
             (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text(
