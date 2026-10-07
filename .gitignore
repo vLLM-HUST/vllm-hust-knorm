@@ -1,0 +1,22 @@
+# Build artifacts
+dist/
+build/
+*.egg-info/
+src/*.egg-info/
+
+# Environments
+.venv/
+.release-smoke/
+.pypi-smoke/
+*.tmp/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+
+# Editors / OS
+.idea/
+.vscode/
+.DS_Store

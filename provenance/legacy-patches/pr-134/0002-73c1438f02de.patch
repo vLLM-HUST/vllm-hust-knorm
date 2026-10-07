@@ -1,0 +1,536 @@
+From 73c1438f02dec47cfe45f494003082c0ef27117c Mon Sep 17 00:00:00 2001
+From: "Shuhao Zhang (Tony)" <5267690+ShuhaoZhangTony@users.noreply.github.com>
+Date: Mon, 20 Jul 2026 10:57:01 +0800
+Subject: [PATCH] ci(ascend): isolate inference HTTP probes
+
+Signed-off-by: Shuhao Zhang (Tony) <5267690+ShuhaoZhangTony@users.noreply.github.com>
+---
+ .github/workflows/scripts/e2e_http_request.py |  58 ++++++
+ .../scripts/run_e2e_inference_regression.sh   |  35 ++--
+ .../workflows/scripts/run_e2e_serve_smoke.sh  |  28 +--
+ .../ci/test_ascend_benchmark_script_static.py |  11 +-
+ tests/ci/test_e2e_http_request.py             | 180 ++++++++++++++++++
+ ...linux_ascend_inference_workflows_static.py |  14 +-
+ 6 files changed, 295 insertions(+), 31 deletions(-)
+ create mode 100644 .github/workflows/scripts/e2e_http_request.py
+ create mode 100644 tests/ci/test_e2e_http_request.py
+
+diff --git a/.github/workflows/scripts/e2e_http_request.py b/.github/workflows/scripts/e2e_http_request.py
+new file mode 100644
+index 000000000000..33932d319b78
+--- /dev/null
++++ b/.github/workflows/scripts/e2e_http_request.py
+@@ -0,0 +1,58 @@
++#!/usr/bin/env python3
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Make an HTTP request without depending on the runner's libcurl ABI."""
++
++from __future__ import annotations
++
++import argparse
++import sys
++import urllib.error
++import urllib.parse
++import urllib.request
++
++
++def parse_header(value: str) -> tuple[str, str]:
++    name, separator, header_value = value.partition(":")
++    if not separator or not name.strip():
++        raise argparse.ArgumentTypeError("headers must use the 'Name: value' form")
++    return name.strip(), header_value.lstrip()
++
++
++def parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("url")
++    parser.add_argument("--method", choices=("GET", "POST"), default="GET")
++    parser.add_argument("--header", action="append", default=[], type=parse_header)
++    parser.add_argument("--data")
++    parser.add_argument("--timeout", type=float, default=30.0)
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = parse_args()
++    parsed_url = urllib.parse.urlsplit(args.url)
++    if parsed_url.scheme not in {"http", "https"}:
++        raise SystemExit("URL scheme must be http or https")
++    if args.timeout <= 0:
++        raise SystemExit("--timeout must be greater than zero")
++
++    data = args.data.encode() if args.data is not None else None
++    request = urllib.request.Request(
++        args.url,
++        data=data,
++        headers=dict(args.header),
++        method=args.method,
++    )
++    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++    try:
++        with opener.open(request, timeout=args.timeout) as response:
++            sys.stdout.buffer.write(response.read())
++    except (urllib.error.URLError, TimeoutError) as exc:
++        print(f"HTTP request failed: {exc}", file=sys.stderr)
++        return 1
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/.github/workflows/scripts/run_e2e_inference_regression.sh b/.github/workflows/scripts/run_e2e_inference_regression.sh
+index 3e19859e1d3a..4174e3eb1eb8 100644
+--- a/.github/workflows/scripts/run_e2e_inference_regression.sh
++++ b/.github/workflows/scripts/run_e2e_inference_regression.sh
+@@ -14,6 +14,8 @@ BENCH_NUM_PROMPTS=${BENCH_NUM_PROMPTS:-5}
+ SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-regression.log}
+ RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-regression-runtime-ready.log}
+ PYTHON_BIN=${PYTHON_BIN:-python}
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++HTTP_REQUEST_SCRIPT=${E2E_HTTP_REQUEST_SCRIPT:-$SCRIPT_DIR/e2e_http_request.py}
+ VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
+ SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+ ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}
+@@ -21,7 +23,7 @@ DEFAULT_SYSTEM_ASCEND_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_ROOT_HELPER:-/usr/loca
+ REPO_ASCEND_ROOT_HELPER=${REPO_ASCEND_ROOT_HELPER:-$VLLM_ASCEND_HUST_REPO/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh}
+ REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT=${REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT:-$VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh}
+ if [[ -n "${ASCEND_E2E_ROOT_HELPER:-}" ]]; then
+-  ASCEND_E2E_ROOT_HELPER=${ASCEND_E2E_ROOT_HELPER}
++  : # Keep the explicitly configured helper.
+ elif [[ -x "$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER" ]]; then
+   ASCEND_E2E_ROOT_HELPER=$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER
+ else
+@@ -118,7 +120,7 @@ export_sudo_preserved_env_vars() {
+ 
+   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
+     if [[ -n "${!var_name+x}" ]]; then
+-      export "$var_name"
++      export "${var_name?}"
+     fi
+   done
+ }
+@@ -420,29 +422,30 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+   local delay_seconds=${E2E_HTTP_REQUEST_DELAY_SECONDS:-2}
++  local timeout_seconds=${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}
+   local attempt=1
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" --timeout "$timeout_seconds" "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -504,7 +507,9 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" \
++    --timeout "${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}" \
++    "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -523,15 +528,16 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+   "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
++http_with_server_log "vLLM completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+@@ -554,10 +560,11 @@ PY
+ rm -f "$completion_response"
+ 
+ chat_response=$(mktemp)
+-curl_with_server_log "vLLM chat completions request" \
++http_with_server_log "vLLM chat completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/chat/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$chat_response"
+ 
+ "$PYTHON_BIN" - "$chat_response" "$MODEL_NAME" <<'PY'
+diff --git a/.github/workflows/scripts/run_e2e_serve_smoke.sh b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+index 2d9f7129bbb0..5462d3074ac6 100644
+--- a/.github/workflows/scripts/run_e2e_serve_smoke.sh
++++ b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+@@ -12,6 +12,8 @@ PROMPT=${PROMPT:-The capital of France is}
+ SERVER_LOG=${SERVER_LOG:-/tmp/vllm-e2e-smoke.log}
+ RUNTIME_READY_LOG=${RUNTIME_READY_LOG:-/tmp/vllm-e2e-smoke-runtime-ready.log}
+ PYTHON_BIN=${PYTHON_BIN:-python}
++SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
++HTTP_REQUEST_SCRIPT=${E2E_HTTP_REQUEST_SCRIPT:-$SCRIPT_DIR/e2e_http_request.py}
+ VLLM_ASCEND_HUST_REPO=${VLLM_ASCEND_HUST_REPO:-${GITHUB_WORKSPACE:-$PWD}/vllm-ascend-hust}
+ SUDO_AUTH_EXIT_CODE=${SUDO_AUTH_EXIT_CODE:-76}
+ ASCEND_E2E_USE_SUDO=${ASCEND_E2E_USE_SUDO:-0}
+@@ -19,7 +21,7 @@ DEFAULT_SYSTEM_ASCEND_ROOT_HELPER=${DEFAULT_SYSTEM_ASCEND_ROOT_HELPER:-/usr/loca
+ REPO_ASCEND_ROOT_HELPER=${REPO_ASCEND_ROOT_HELPER:-$VLLM_ASCEND_HUST_REPO/.github/workflows/scripts/run_ascend_benchmark_root_helper.sh}
+ REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT=${REPO_ASCEND_ROOT_HELPER_INSTALL_SCRIPT:-$VLLM_ASCEND_HUST_REPO/scripts/install_ascend_benchmark_root_helper.sh}
+ if [[ -n "${ASCEND_E2E_ROOT_HELPER:-}" ]]; then
+-  ASCEND_E2E_ROOT_HELPER=${ASCEND_E2E_ROOT_HELPER}
++  : # Keep the explicitly configured helper.
+ elif [[ -x "$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER" ]]; then
+   ASCEND_E2E_ROOT_HELPER=$DEFAULT_SYSTEM_ASCEND_ROOT_HELPER
+ else
+@@ -115,7 +117,7 @@ export_sudo_preserved_env_vars() {
+ 
+   for var_name in "${SUDO_PRESERVE_ENV_VARS[@]}"; do
+     if [[ -n "${!var_name+x}" ]]; then
+-      export "$var_name"
++      export "${var_name?}"
+     fi
+   done
+ }
+@@ -417,29 +419,30 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+   local delay_seconds=${E2E_HTTP_REQUEST_DELAY_SECONDS:-2}
++  local timeout_seconds=${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}
+   local attempt=1
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" --timeout "$timeout_seconds" "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP probe exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -501,7 +504,9 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if "$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT" \
++    --timeout "${E2E_HTTP_REQUEST_TIMEOUT_SECONDS:-30}" \
++    "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -520,15 +525,16 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+   "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
++http_with_server_log "vLLM completions request" \
++  --method POST \
++  --header "Content-Type: application/json" \
++  --data "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+diff --git a/tests/ci/test_ascend_benchmark_script_static.py b/tests/ci/test_ascend_benchmark_script_static.py
+index 0989f5101f04..cac164661057 100644
+--- a/tests/ci/test_ascend_benchmark_script_static.py
++++ b/tests/ci/test_ascend_benchmark_script_static.py
+@@ -78,7 +78,7 @@ def test_same_spec_runner_resolves_spec_from_shared_registry():
+     assert '--repo-root "$VLLM_HUST_BENCHMARK_REPO"' in same_spec_block
+ 
+ 
+-def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
++def test_e2e_inference_scripts_use_python_http_probe_with_server_log():
+     for script_name in (
+         "run_e2e_serve_smoke.sh",
+         "run_e2e_inference_regression.sh",
+@@ -86,13 +86,16 @@ def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
+         text = script_text(script_name)
+ 
+         assert "print_server_log_tail() {" in text
+-        assert "curl_with_server_log() {" in text
++        assert "http_with_server_log() {" in text
++        assert "e2e_http_request.py" in text
++        assert '"$PYTHON_BIN" "$HTTP_REQUEST_SCRIPT"' in text
+         assert "E2E_HTTP_REQUEST_ATTEMPTS" in text
++        assert "E2E_HTTP_REQUEST_TIMEOUT_SECONDS" in text
+         assert "else\n      rc=$?\n    fi" in text
+         assert "failed after ${max_attempts} attempts" in text
+-        assert 'done\n\ncurl -fsS "http://$HOST:$PORT/v1/models" >/dev/null' not in text
++        assert "curl -fsS" not in text
+         assert "vLLM models endpoint readiness confirmation" in text
+         assert (
+-            "curl_with_server_log"
++            "http_with_server_log"
+             in text[text.index("completion_response=$(mktemp)") :]
+         )
+diff --git a/tests/ci/test_e2e_http_request.py b/tests/ci/test_e2e_http_request.py
+new file mode 100644
+index 000000000000..25c48edd94c8
+--- /dev/null
++++ b/tests/ci/test_e2e_http_request.py
+@@ -0,0 +1,180 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++from __future__ import annotations
++
++import os
++import subprocess
++import sys
++import threading
++from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++SCRIPT_PATH = (
++    Path(__file__).resolve().parents[2]
++    / ".github/workflows/scripts/e2e_http_request.py"
++)
++
++
++class RequestHandler(BaseHTTPRequestHandler):
++    request_body = b""
++    content_type = ""
++
++    def do_GET(self) -> None:
++        if self.path == "/failure":
++            self.send_response(503)
++        else:
++            self.send_response(200)
++        self.end_headers()
++        self.wfile.write(b'{"ready":true}')
++
++    def do_POST(self) -> None:
++        length = int(self.headers["Content-Length"])
++        type(self).request_body = self.rfile.read(length)
++        type(self).content_type = self.headers["Content-Type"]
++        self.send_response(200)
++        self.end_headers()
++        self.wfile.write(b'{"accepted":true}')
++
++    def log_message(self, format: str, *args: object) -> None:
++        pass
++
++
++class ProxyRequestHandler(BaseHTTPRequestHandler):
++    request_count = 0
++
++    def do_GET(self) -> None:
++        type(self).request_count += 1
++        self.send_response(502)
++        self.end_headers()
++
++    def log_message(self, format: str, *args: object) -> None:
++        pass
++
++
++def run_server(
++    handler: type[BaseHTTPRequestHandler] = RequestHandler,
++) -> tuple[ThreadingHTTPServer, threading.Thread]:
++    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    return server, thread
++
++
++def test_request_avoids_broken_curl_under_contaminated_environment(tmp_path: Path):
++    fake_bin = tmp_path / "bin"
++    fake_bin.mkdir()
++    fake_curl = fake_bin / "curl"
++    fake_curl.write_text(
++        "#!/bin/sh\n"
++        "echo 'curl: symbol lookup error: /lib64/libldap.so.2: undefined symbol: "
++        "EVP_md2, version OPENSSL_3.0.0' >&2\n"
++        "exit 127\n",
++        encoding="utf-8",
++    )
++    fake_curl.chmod(0o755)
++
++    contaminated_env = os.environ.copy()
++    contaminated_env["PATH"] = f"{fake_bin}:{contaminated_env['PATH']}"
++    contaminated_env["LD_LIBRARY_PATH"] = str(tmp_path / "conda-lib")
++
++    broken_curl = subprocess.run(
++        ["curl", "--version"],
++        env=contaminated_env,
++        capture_output=True,
++        text=True,
++        check=False,
++    )
++    assert broken_curl.returncode == 127
++    assert "EVP_md2" in broken_curl.stderr
++
++    server, thread = run_server()
++    proxy, proxy_thread = run_server(ProxyRequestHandler)
++    proxy_url = f"http://127.0.0.1:{proxy.server_port}"
++    contaminated_env.update(
++        {
++            "ALL_PROXY": proxy_url,
++            "HTTP_PROXY": proxy_url,
++            "HTTPS_PROXY": proxy_url,
++            "NO_PROXY": "",
++            "all_proxy": proxy_url,
++            "http_proxy": proxy_url,
++            "https_proxy": proxy_url,
++            "no_proxy": "",
++        }
++    )
++    ProxyRequestHandler.request_count = 0
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                f"http://127.0.0.1:{server.server_port}/v1/models",
++            ],
++            env=contaminated_env,
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++        proxy.shutdown()
++        proxy_thread.join()
++        proxy.server_close()
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == '{"ready":true}'
++    assert ProxyRequestHandler.request_count == 0
++
++
++def test_request_posts_json_body_and_header():
++    server, thread = run_server()
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                "--method",
++                "POST",
++                "--header",
++                "Content-Type: application/json",
++                "--data",
++                '{"prompt":"hello"}',
++                f"http://127.0.0.1:{server.server_port}/v1/completions",
++            ],
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++
++    assert result.returncode == 0, result.stderr
++    assert result.stdout == '{"accepted":true}'
++    assert RequestHandler.request_body == b'{"prompt":"hello"}'
++    assert RequestHandler.content_type == "application/json"
++
++
++def test_request_fails_on_non_success_status():
++    server, thread = run_server()
++    try:
++        result = subprocess.run(
++            [
++                sys.executable,
++                str(SCRIPT_PATH),
++                f"http://127.0.0.1:{server.server_port}/failure",
++            ],
++            capture_output=True,
++            text=True,
++            check=False,
++        )
++    finally:
++        server.shutdown()
++        thread.join()
++        server.server_close()
++
++    assert result.returncode == 1
++    assert "HTTP Error 503" in result.stderr
+diff --git a/tests/ci/test_linux_ascend_inference_workflows_static.py b/tests/ci/test_linux_ascend_inference_workflows_static.py
+index e5225f0edf10..aa2fdc804214 100644
+--- a/tests/ci/test_linux_ascend_inference_workflows_static.py
++++ b/tests/ci/test_linux_ascend_inference_workflows_static.py
+@@ -70,8 +70,18 @@ def test_inference_workflows_install_matching_ascend_torch_stack():
+         text = workflow_path.read_text(encoding="utf-8")
+ 
+         assert "Install Ascend torch stack for preflight" in text
+-        assert '"$PYTHON_BIN" -c "import torch, torch_npu;' in text
+-        assert '"$PYTHON_BIN" -m pip install "torch==2.9.0" "torch-npu==2.9.0"' in text
++        assert "bash .github/workflows/scripts/ensure_ascend_torch_stack.sh" in text
++
++    helper_text = (
++        REPO_ROOT / ".github/workflows/scripts/ensure_ascend_torch_stack.sh"
++    ).read_text(encoding="utf-8")
++    assert 'ASCEND_TORCH_VERSION="${ASCEND_TORCH_VERSION:-2.10.0}"' in helper_text
++    assert (
++        'ASCEND_TORCH_NPU_VERSION="${ASCEND_TORCH_NPU_VERSION:-2.10.0}"' in helper_text
++    )
++    assert '"torch==$ASCEND_TORCH_VERSION"' in helper_text
++    assert '"torch-npu==$ASCEND_TORCH_NPU_VERSION"' in helper_text
++    assert "import torch\nimport torch_npu" in helper_text
+ 
+ 
+ def test_inference_workflows_disable_backend_autoload_during_install_checks():

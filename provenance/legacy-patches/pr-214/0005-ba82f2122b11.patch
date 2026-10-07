@@ -1,0 +1,116 @@
+From ba82f2122b117de38542e9db09f5747a83013b71 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Mon, 3 Aug 2026 16:12:31 +0000
+Subject: [PATCH] style(knorm): apply ruff format to Knorm test and source
+ files
+
+---
+ tests/ci/test_knorm_runner_static.py    | 10 ++++++----
+ tests/v1/test_kv_cache_spec_registry.py | 26 ++++++++++++++-----------
+ 2 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/tests/ci/test_knorm_runner_static.py b/tests/ci/test_knorm_runner_static.py
+index a2c7b37517ff..dbdc16eb383f 100644
+--- a/tests/ci/test_knorm_runner_static.py
++++ b/tests/ci/test_knorm_runner_static.py
+@@ -3,6 +3,7 @@
+ """Static AST checks for issue #163: verify that gpu_model_runner guards
+ all Knorm code paths with _knorm_active / _knorm_wrapper_installed so no
+ half-enabled state can occur."""
++
+ from __future__ import annotations
+ 
+ import ast
+@@ -36,15 +37,16 @@ def test_knorm_active_flag_defined_in_init():
+     register_all_kvcache_specs."""
+     tree = _tree()
+     cls = next(
+-        n for n in ast.walk(tree)
++        n
++        for n in ast.walk(tree)
+         if isinstance(n, ast.ClassDef) and n.name == "GPUModelRunner"
+     )
+     init = next(
+-        n for n in cls.body
+-        if isinstance(n, ast.FunctionDef) and n.name == "__init__"
++        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "__init__"
+     )
+     active_assigns = [
+-        n for n in ast.walk(init)
++        n
++        for n in ast.walk(init)
+         if isinstance(n, (ast.Assign, ast.AnnAssign))
+         and _attr_name(n) == "_knorm_active"
+     ]
+diff --git a/tests/v1/test_kv_cache_spec_registry.py b/tests/v1/test_kv_cache_spec_registry.py
+index 2f4aab46e636..acaeae956181 100644
+--- a/tests/v1/test_kv_cache_spec_registry.py
++++ b/tests/v1/test_kv_cache_spec_registry.py
+@@ -223,7 +223,9 @@ def test_knorm_is_not_registered_when_disabled_even_without_prefix_caching(
+         vice versa). See issue #163."""
+         monkeypatch.setenv("VLLM_KNORM_ENABLED", "0")
+         import importlib
++
+         import vllm.envs as envs_mod
++
+         importlib.reload(envs_mod)
+ 
+         _REGISTRY_KVCACHESPEC_LIST.clear()
+@@ -235,9 +237,7 @@ def test_knorm_is_not_registered_when_disabled_even_without_prefix_caching(
+         spec = make_spec(FullAttentionSpec)
+         assert KVCacheSpecRegistry.get_manager_class(spec) is FullAttentionManager
+ 
+-    def test_knorm_is_not_registered_when_compression_ratio_is_one(
+-        self, monkeypatch
+-    ):
++    def test_knorm_is_not_registered_when_compression_ratio_is_one(self, monkeypatch):
+         """Knorm manager must NOT register when compression_ratio=1.0 (no
+         compression) even if VLLM_KNORM_ENABLED=1 and prefix caching is off.
+         compression_ratio=1.0 means no blocks would be evicted, so installing
+@@ -247,7 +247,9 @@ def test_knorm_is_not_registered_when_compression_ratio_is_one(
+         monkeypatch.setenv("VLLM_KNORM_ENABLED", "1")
+         monkeypatch.setenv("VLLM_KNORM_COMPRESSION_RATIO", "1.0")
+         import importlib
++
+         import vllm.envs as envs_mod
++
+         importlib.reload(envs_mod)
+ 
+         _REGISTRY_KVCACHESPEC_LIST.clear()
+@@ -265,19 +267,20 @@ def test_knorm_coverage_matrix(self, monkeypatch):
+         register_all_kvcache_specs agree on manager type for every
+         combination. See issue #163 review feedback."""
+         import importlib
++
+         import vllm.envs as envs_mod
+         from vllm.knorm.config import should_activate
+ 
+         cases = [
+             # (knorm_enabled, compression_ratio, prefix_caching, expected_knorm)
+-            ("1", "0.5", False, True),   # fully active
+-            ("1", "0.5", True,  False),   # prefix caching blocks
+-            ("1", "1.0", False, False),   # ratio=1.0 blocks
+-            ("1", "1.0", True,  False),   # both block
+-            ("0", "0.5", False, False),   # disabled
+-            ("0", "0.5", True,  False),   # disabled + prefix
+-            ("0", "1.0", False, False),   # all off
+-            ("0", "1.0", True,  False),   # all off + prefix
++            ("1", "0.5", False, True),  # fully active
++            ("1", "0.5", True, False),  # prefix caching blocks
++            ("1", "1.0", False, False),  # ratio=1.0 blocks
++            ("1", "1.0", True, False),  # both block
++            ("0", "0.5", False, False),  # disabled
++            ("0", "0.5", True, False),  # disabled + prefix
++            ("0", "1.0", False, False),  # all off
++            ("0", "1.0", True, False),  # all off + prefix
+         ]
+ 
+         for enabled, ratio, prefix_caching, expected_knorm in cases:
+@@ -303,6 +306,7 @@ def test_knorm_coverage_matrix(self, monkeypatch):
+             manager_cls = KVCacheSpecRegistry.get_manager_class(spec)
+             if expected_knorm:
+                 from vllm.knorm.manager import KnormFullAttentionManager
++
+                 assert manager_cls is KnormFullAttentionManager, (
+                     f"Expected KnormFullAttentionManager for "
+                     f"ENABLED={enabled}, RATIO={ratio}, prefix={prefix_caching}"

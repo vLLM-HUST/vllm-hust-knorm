@@ -1,0 +1,161 @@
+From 71019992a40eab4b502c1df66a87602a3655a984 Mon Sep 17 00:00:00 2001
+From: Paul Cheng <chengyuejia@foxmail.com>
+Date: Mon, 3 Aug 2026 22:17:03 +0800
+Subject: [PATCH] fix(knorm): unify Knorm activation conditions to fix
+ prefix-repetition-online regression
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Issue #163: prefix-repetition-online throughput dropped 78% (234→51 tok/s)
+because Knorm was in a "half-enabled" state — the three code sites that
+control Knorm used inconsistent conditions:
+
+  1. register_all_kvcache_specs: `not prefix_caching` (missing VLLM_KNORM_ENABLED)
+  2. gpu_model_runner hooks:    no guard at all
+  3. config.is_active:           `VLLM_KNORM_ENABLED and ratio < 1.0` (missing not prefix_caching)
+
+When prefix caching was ON, the Knorm attention wrapper was still installed
+and computed key L2 norms every forward, but KnormFullAttentionManager was
+not registered to consume the scores — wasting compute and changing attention
+behavior (early EOS, output tokens halved).
+
+Fix: introduce `_knorm_active = VLLM_KNORM_ENABLED and not enable_prefix_caching`
+as the single source of truth and use it to guard all three sites:
+  - register_all_kvcache_specs: add VLLM_KNORM_ENABLED to registration condition
+  - gpu_model_runner.__init__: add _knorm_active flag
+  - gpu_model_runner hooks: guard install/collect/attach with _knorm_active
+
+This supersedes #209 which only guarded the runner hooks without fixing the
+registration condition.
+
+Closes #163
+---
+ vllm/v1/core/single_type_kv_cache_manager.py | 22 +++++++-----
+ vllm/v1/worker/gpu_model_runner.py           | 35 +++++++++++++++-----
+ 2 files changed, 40 insertions(+), 17 deletions(-)
+
+diff --git a/vllm/v1/core/single_type_kv_cache_manager.py b/vllm/v1/core/single_type_kv_cache_manager.py
+index 7b1597cf1822..2a5a3169807c 100644
+--- a/vllm/v1/core/single_type_kv_cache_manager.py
++++ b/vllm/v1/core/single_type_kv_cache_manager.py
+@@ -1507,15 +1507,24 @@ def get_manager_for_kv_cache_spec(
+ 
+ def register_all_kvcache_specs(vllm_config):
+     """Built-in spec registration"""
++    from vllm import envs
++
+     full_attention_manager = FullAttentionManager
+     prefix_caching_enabled = (
+         vllm_config is not None
+         and vllm_config.cache_config is not None
+         and vllm_config.cache_config.enable_prefix_caching
+     )
++    # KnormFullAttentionManager is registered only when Knorm is explicitly
++    # enabled (VLLM_KNORM_ENABLED) AND prefix caching is disabled. This
++    # keeps the registration condition consistent with the runner-side
++    # _knorm_active guard in gpu_model_runner.py, avoiding the
++    # "half-enabled" state where the wrapper is installed but the
++    # manager is not registered (or vice versa). See issue #163.
+     knorm_compatible = (
+         vllm_config is not None
+         and vllm_config.cache_config is not None
++        and envs.VLLM_KNORM_ENABLED
+         and not vllm_config.cache_config.enable_prefix_caching
+     )
+     if knorm_compatible:
+@@ -1525,14 +1534,11 @@ def register_all_kvcache_specs(vllm_config):
+             full_attention_manager = KnormFullAttentionManager
+         except ImportError:
+             pass  # knorm module not installed - use default FullAttentionManager
+-    elif prefix_caching_enabled:
+-        from vllm import envs
+-
+-        if envs.VLLM_KNORM_ENABLED:
+-            logger.warning_once(
+-                "Knorm KV compression is disabled because prefix caching is enabled. "
+-                "Set --no-enable-prefix-caching to use Knorm."
+-            )
++    elif prefix_caching_enabled and envs.VLLM_KNORM_ENABLED:
++        logger.warning_once(
++            "Knorm KV compression is disabled because prefix caching is enabled. "
++            "Set --no-enable-prefix-caching to use Knorm."
++        )
+ 
+     KVCacheSpecRegistry.register(
+         FullAttentionSpec,
+diff --git a/vllm/v1/worker/gpu_model_runner.py b/vllm/v1/worker/gpu_model_runner.py
+index 3d43bb07d3cb..d4261889b6f5 100644
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -917,6 +917,15 @@ def __init__(
+         self.kv_connector_output: KVConnectorOutput | None = None
+         self._knorm_scores: dict | None = None
+         self._knorm_wrapper_installed: bool = False
++        # Knorm is active only when explicitly enabled AND prefix caching
++        # is disabled. This must match register_all_kvcache_specs in
++        # single_type_kv_cache_manager.py to avoid a half-enabled state
++        # where the wrapper is installed but the manager is not registered
++        # (or vice versa). See issue #163.
++        self._knorm_active: bool = bool(
++            envs.VLLM_KNORM_ENABLED
++            and not self.cache_config.enable_prefix_caching
++        )
+         self.mamba_state_idx: dict[str, int] = {}
+         self._mamba_bufs: mamba_utils.MambaBuffers | None = None
+         self.mamba_prev_last_scheduled_idx: CpuGpuBuffer | None = None
+@@ -4099,8 +4108,11 @@ def execute_model(
+                 "after execute_model() returns None."
+             )
+ 
+-        # Knorm: install Ascend attention wrapper on first forward.
+-        if not getattr(self, "_knorm_wrapper_installed", False):
++        # Knorm: install Ascend attention wrapper on first forward, but
++        # only when knorm is active (enabled AND prefix caching disabled).
++        # When prefix caching is on, the wrapper would add per-forward
++        # overhead with no consumer (KnormFullAttentionManager not registered).
++        if self._knorm_active and not self._knorm_wrapper_installed:
+             from vllm.knorm.attention_backend import install_ascend_wrapper
+ 
+             install_ascend_wrapper()
+@@ -4463,8 +4475,9 @@ def execute_model(
+         if deferred_state_corrections_fn:
+             deferred_state_corrections_fn()
+ 
+-        # Knorm: collect key L2 norms from attention backend after forward.
+-        if get_pp_group().is_last_rank:
++        # Knorm: collect key L2 norms from attention backend after forward,
++        # but only when the wrapper was actually installed.
++        if self._knorm_wrapper_installed and get_pp_group().is_last_rank:
+             from vllm.knorm.hooks import collect_knorm_scores
+ 
+             collect_knorm_scores(self, self.input_batch)
+@@ -4690,9 +4703,10 @@ def propose_draft_token_ids(sampled_token_ids):
+             )
+ 
+         if not self.use_async_scheduling:
+-            from vllm.knorm.hooks import attach_knorm_scores
++            if self._knorm_wrapper_installed:
++                from vllm.knorm.hooks import attach_knorm_scores
+ 
+-            attach_knorm_scores(self, output)
++                attach_knorm_scores(self, output)
+             if self.routed_experts_initialized:
+                 # Sync path: D2H was issued in ``_bookkeeping_sync`` and
+                 # synchronized by ``_to_list``'s event.synchronize(), so
+@@ -4752,9 +4766,12 @@ def propose_draft_token_ids(sampled_token_ids):
+ 
+         # Knorm: attach scores directly (not via attach_knorm_scores,
+         # which calls get_output() — a destructive one-shot method).
+-        knorm_scores = getattr(self, "_knorm_scores", None)
+-        if knorm_scores:
+-            async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
++        # Guarded by _knorm_wrapper_installed so the getattr is skipped
++        # entirely when knorm is inactive.
++        if self._knorm_wrapper_installed:
++            knorm_scores = getattr(self, "_knorm_scores", None)
++            if knorm_scores:
++                async_output.knorm_block_scores = knorm_scores  # type: ignore[attr-defined]
+         return async_output
+ 
+     def _pp_broadcast_prev_sampled_token_ids(

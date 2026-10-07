@@ -1,0 +1,109 @@
+From c2b26b9442f46b49f1b1face5d49c52ce0898d23 Mon Sep 17 00:00:00 2001
+From: kotoriqaq0 <2216804318@qq.com>
+Date: Fri, 26 Jun 2026 20:51:59 +0800
+Subject: [PATCH] refactor: register knorm env vars in envs.py and read from
+ vllm.envs
+
+Move Knorm environment variable registration from ad-hoc os.environ.get()
+calls in config.py to the centralized environment_variables dict in envs.py,
+following the vLLM convention used by all other runtime flags.
+
+This ensures knorm env vars are discoverable via envs listing tools, cached
+after service initialization, and managed consistently with the rest of vLLM.
+
+Co-authored-by: Claude <noreply@anthropic.com>
+Signed-off-by: kotoriqaq0 <2216804318@qq.com>
+---
+ vllm/envs.py         | 17 +++++++++++++++++
+ vllm/knorm/config.py | 26 ++++++++++----------------
+ 2 files changed, 27 insertions(+), 16 deletions(-)
+
+diff --git a/vllm/envs.py b/vllm/envs.py
+index 4d1884860995..f3d4387cdf3f 100755
+--- a/vllm/envs.py
++++ b/vllm/envs.py
+@@ -1764,6 +1764,23 @@ def _get_or_set_default() -> str:
+     "VLLM_XPU_ENABLE_XPU_GRAPH": lambda: bool(
+         int(os.getenv("VLLM_XPU_ENABLE_XPU_GRAPH", "0"))
+     ),
++    # ================== Knorm KV Cache Compression ==================
++    # Fraction of KV cache blocks to KEEP. 1.0 = no compression.
++    "VLLM_KNORM_COMPRESSION_RATIO": lambda: float(
++        os.getenv("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
++    ),
++    # Number of tokens at the sequence start to always keep (attention sink).
++    "VLLM_KNORM_WARMUP_TOKENS": lambda: int(
++        os.getenv("VLLM_KNORM_WARMUP_TOKENS", "32")
++    ),
++    # Whether Knorm compression is enabled. Set to '0' to disable.
++    "VLLM_KNORM_ENABLED": lambda: bool(int(os.getenv("VLLM_KNORM_ENABLED", "1"))),
++    # How to aggregate token norms within a block: 'min', 'mean', or 'max'.
++    "VLLM_KNORM_SCORE_AGGREGATION": lambda: os.getenv(
++        "VLLM_KNORM_SCORE_AGGREGATION", "min"
++    ),
++    # How to reduce norms across heads: 'mean', 'max', or 'sum'.
++    "VLLM_KNORM_NORM_REDUCE_OP": lambda: os.getenv("VLLM_KNORM_NORM_REDUCE_OP", "mean"),
+ }
+ 
+ 
+diff --git a/vllm/knorm/config.py b/vllm/knorm/config.py
+index de940d2eefae..a5209be253f0 100644
+--- a/vllm/knorm/config.py
++++ b/vllm/knorm/config.py
+@@ -1,46 +1,40 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
+-"""Knorm configuration, read from environment variables."""
++"""Knorm configuration, read from registered vLLM environment variables."""
+ 
+ from __future__ import annotations
+ 
+-import os
+ from dataclasses import dataclass, field
+ 
++import vllm.envs as envs
++
+ 
+ @dataclass
+ class KnormConfig:
+     """Knorm compression configuration.
+ 
+-    All values are read from environment variables at construction time.
++    All values are read from vllm.envs, which lazily evaluates
++    environment variables registered in ``environment_variables`` dict.
+     """
+ 
+     compression_ratio: float = field(
+-        default_factory=lambda: float(
+-            os.environ.get("VLLM_KNORM_COMPRESSION_RATIO", "0.5")
+-        )
++        default_factory=lambda: envs.VLLM_KNORM_COMPRESSION_RATIO
+     )
+     """Fraction of KV cache blocks to KEEP. 1.0 = no compression."""
+ 
+-    warmup_tokens: int = field(
+-        default_factory=lambda: int(os.environ.get("VLLM_KNORM_WARMUP_TOKENS", "32"))
+-    )
++    warmup_tokens: int = field(default_factory=lambda: envs.VLLM_KNORM_WARMUP_TOKENS)
+     """Tokens at the sequence start to always keep (attention sink)."""
+ 
+-    enabled: bool = field(
+-        default_factory=lambda: os.environ.get("VLLM_KNORM_ENABLED", "1") == "1"
+-    )
++    enabled: bool = field(default_factory=lambda: envs.VLLM_KNORM_ENABLED)
+     """Whether Knorm compression is enabled. Set to '0' to disable."""
+ 
+     score_aggregation: str = field(
+-        default_factory=lambda: os.environ.get("VLLM_KNORM_SCORE_AGGREGATION", "min")
++        default_factory=lambda: envs.VLLM_KNORM_SCORE_AGGREGATION
+     )
+     """How to aggregate token norms within a block: 'min', 'mean', or 'max'."""
+ 
+-    norm_reduce_op: str = field(
+-        default_factory=lambda: os.environ.get("VLLM_KNORM_NORM_REDUCE_OP", "mean")
+-    )
++    norm_reduce_op: str = field(default_factory=lambda: envs.VLLM_KNORM_NORM_REDUCE_OP)
+     """How to reduce norms across heads: 'mean', 'max', or 'sum'."""
+ 
+     @property

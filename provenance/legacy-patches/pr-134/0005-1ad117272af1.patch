@@ -1,0 +1,510 @@
+From f098316a80fcf9376d15c046f1bf22e88507e764 Mon Sep 17 00:00:00 2001
+From: Jun Hao Ma <180929231+kms12425-ctrl@users.noreply.github.com>
+Date: Sun, 19 Jul 2026 07:34:54 +0000
+Subject: [PATCH 1/3] fix(cpu): avoid torch cpu capabilities on macos
+
+---
+ csrc/cpu/utils.hpp | 65 +++++++++++++++++++++++++++-------------------
+ 1 file changed, 39 insertions(+), 26 deletions(-)
+
+diff --git a/csrc/cpu/utils.hpp b/csrc/cpu/utils.hpp
+index ec10a0f35244..5c01b5dcd91f 100644
+--- a/csrc/cpu/utils.hpp
++++ b/csrc/cpu/utils.hpp
+@@ -2,10 +2,15 @@
+ #define UTILS_HPP
+ 
+ #include <atomic>
++#include <cstdint>
+ #include <string>
+ #include <unistd.h>
+ #include <ATen/cpu/Utils.h>
+ 
++#if defined(__APPLE__)
++#include <sys/sysctl.h>
++#endif
++
+ #include "cpu/cpu_types.hpp"
+ 
+ namespace cpu_utils {
+@@ -58,35 +63,43 @@ struct Counter {
+   int64_t acquire_counter() { return counter++; }
+ };
+ 
+-inline int64_t get_available_l2_size() {
+-#if defined(__s390x__) || defined(__powerpc__)
+-  static int64_t size = []() {
+-    uint32_t l2_cache_size = 0;
+-    auto caps = at::cpu::get_cpu_capabilities();
+-    auto it = caps.find("l2_cache_size");
+-    if (it != caps.end()) {
+-      l2_cache_size = static_cast<uint32_t>(it->second.toInt());
+-    }
+-    if (l2_cache_size == 0) {
+-      long sys_l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
+-      if (sys_l2 > 0) {
+-        l2_cache_size = static_cast<uint32_t>(sys_l2);
+-      }
+-    }
+-    if (l2_cache_size == 0) {
+-      l2_cache_size = 256 * 1024;
++inline uint32_t get_l2_cache_size_or_default() {
++  uint32_t l2_cache_size = 0;
++
++#if defined(__APPLE__)
++  uint64_t sys_l2 = 0;
++  size_t value_size = sizeof(sys_l2);
++  if (sysctlbyname("hw.l2cachesize", &sys_l2, &value_size, nullptr, 0) == 0 &&
++      sys_l2 > 0) {
++    l2_cache_size = static_cast<uint32_t>(sys_l2);
++  }
++#elif defined(__s390x__) || defined(__powerpc__)
++  auto caps = at::cpu::get_cpu_capabilities();
++  auto it = caps.find("l2_cache_size");
++  if (it != caps.end()) {
++    l2_cache_size = static_cast<uint32_t>(it->second.toInt());
++  }
++  if (l2_cache_size == 0) {
++    long sys_l2 = sysconf(_SC_LEVEL2_CACHE_SIZE);
++    if (sys_l2 > 0) {
++      l2_cache_size = static_cast<uint32_t>(sys_l2);
+     }
+-    return static_cast<int64_t>(l2_cache_size) >> 1;  // use 50% of L2 cache
+-  }();
+-  return size;
++  }
+ #else
+-  static int64_t size = []() {
+-    auto caps = at::cpu::get_cpu_capabilities();
+-    const uint32_t l2_cache_size = caps.at("l2_cache_size").toInt();
+-    return l2_cache_size >> 1;  // use 50% of L2 cache
+-  }();
+-  return size;
++  auto caps = at::cpu::get_cpu_capabilities();
++  l2_cache_size = static_cast<uint32_t>(caps.at("l2_cache_size").toInt());
+ #endif
++
++  if (l2_cache_size == 0) {
++    l2_cache_size = 256 * 1024;
++  }
++  return l2_cache_size;
++}
++
++inline int64_t get_available_l2_size() {
++  static int64_t size =
++      static_cast<int64_t>(get_l2_cache_size_or_default()) >> 1;
++  return size;
+ }
+ 
+ template <int32_t alignment_v, typename T>
+
+From d0fab24f3f28b4721d77453f564d9dda590024aa Mon Sep 17 00:00:00 2001
+From: luoxiaohei <luoxiaohei@ppio.com>
+Date: Mon, 13 Jul 2026 10:22:12 +0800
+Subject: [PATCH 2/3] Improve scheduled benchmark diagnostics
+
+Assisted-by: OpenAI Codex
+---
+ .../run_ascend_benchmark_scenario_list.sh     | 79 +++++++++++++++----
+ .../test_ascend_benchmark_workflow_static.py  | 22 ++++++
+ 2 files changed, 85 insertions(+), 16 deletions(-)
+
+diff --git a/.github/workflows/scripts/run_ascend_benchmark_scenario_list.sh b/.github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
+index 48c77edc8256..bb8ff740505f 100755
+--- a/.github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
++++ b/.github/workflows/scripts/run_ascend_benchmark_scenario_list.sh
+@@ -30,6 +30,32 @@ write_env() {
+   } >> "$GITHUB_ENV"
+ }
+ 
++print_file_tail() {
++  local label=$1
++  local path=$2
++  local lines=${3:-120}
++
++  if [[ -f "$path" ]]; then
++    echo "---- ${label}: ${path} (last ${lines} lines) ----" >&2
++    tail -n "$lines" "$path" >&2
++    echo "---- end ${label} ----" >&2
++  else
++    echo "---- ${label}: ${path} not found ----" >&2
++  fi
++}
++
++print_multi_scenario_summary() {
++  local summary_file=$1
++
++  echo "---- multi-scenario benchmark summary ----" >&2
++  if command -v column >/dev/null 2>&1; then
++    column -t -s $'\t' "$summary_file" >&2 || cat "$summary_file" >&2
++  else
++    cat "$summary_file" >&2
++  fi
++  echo "---- end multi-scenario benchmark summary ----" >&2
++}
++
+ scenarios=()
+ SCENARIOS_RAW=${SCENARIOS_RAW//$'\n'/,}
+ IFS=',' read -r -a raw_scenarios <<< "$SCENARIOS_RAW"
+@@ -61,25 +87,29 @@ for scenario in "${scenarios[@]}"; do
+   scenario_result_root="${RESULT_ROOT_BASE}/${slug}"
+   scenario_submission_dir="${scenario_result_root}/submissions/${scenario_run_id}"
+   scenario_raw_result="${scenario_result_root}/raw_benchmark.json"
++  scenario_log="${scenario_result_root}/scenario.log"
++  mkdir -p "$scenario_result_root"
+ 
+   echo "::group::Ascend benchmark scenario: ${scenario}"
+   set +e
+-  BENCH_SCENARIO="$scenario" \
+-    BENCH_SCENARIOS="$scenario" \
+-    BENCH_SCENARIO_COUNT=1 \
+-    RUN_ID="$scenario_run_id" \
+-    RESULT_ROOT="$scenario_result_root" \
+-    RAW_RESULT_FILE="$scenario_raw_result" \
+-    SUBMISSIONS_ROOT="${scenario_result_root}/submissions" \
+-    SUBMISSION_DIR="$scenario_submission_dir" \
+-    AGGREGATE_OUTPUT_DIR="${scenario_result_root}/leaderboard-data" \
+-    SERVER_LOG="${scenario_result_root}/server.log" \
+-    RUNNER_PREFLIGHT_FAILURE_FILE="${scenario_result_root}/runner_preflight_failure.txt" \
+-    DIAGNOSTICS_DIR="${scenario_result_root}/diagnostics" \
+-    NODE_ENV_FAILURE_FILE="${scenario_result_root}/node_env_failure.txt" \
+-    SAME_SPEC_SPEC_FILE="" \
+-    bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
+-  scenario_exit_code=$?
++  (
++    BENCH_SCENARIO="$scenario" \
++      BENCH_SCENARIOS="$scenario" \
++      BENCH_SCENARIO_COUNT=1 \
++      RUN_ID="$scenario_run_id" \
++      RESULT_ROOT="$scenario_result_root" \
++      RAW_RESULT_FILE="$scenario_raw_result" \
++      SUBMISSIONS_ROOT="${scenario_result_root}/submissions" \
++      SUBMISSION_DIR="$scenario_submission_dir" \
++      AGGREGATE_OUTPUT_DIR="${scenario_result_root}/leaderboard-data" \
++      SERVER_LOG="${scenario_result_root}/server.log" \
++      RUNNER_PREFLIGHT_FAILURE_FILE="${scenario_result_root}/runner_preflight_failure.txt" \
++      DIAGNOSTICS_DIR="${scenario_result_root}/diagnostics" \
++      NODE_ENV_FAILURE_FILE="${scenario_result_root}/node_env_failure.txt" \
++      SAME_SPEC_SPEC_FILE="" \
++      bash .github/workflows/scripts/run_ascend_benchmark_ci.sh
++  ) 2>&1 | tee "$scenario_log"
++  scenario_exit_code=${PIPESTATUS[0]}
+   set -e
+   echo "::endgroup::"
+ 
+@@ -98,4 +128,21 @@ done
+ 
+ write_env BENCHMARK_MULTI_SCENARIO_SUMMARY_FILE "$summary_file"
+ echo "Multi-scenario benchmark summary: $summary_file"
++print_multi_scenario_summary "$summary_file"
++
++if [[ "$overall_exit_code" -ne 0 ]]; then
++  while IFS=$'\t' read -r scenario scenario_run_id scenario_result_root raw_result submission_dir exit_code; do
++    if [[ "$scenario" == "scenario" || -z "$scenario" || "$exit_code" == "0" ]]; then
++      continue
++    fi
++
++    echo "::group::Failed Ascend benchmark scenario diagnostics: ${scenario}"
++    print_file_tail "scenario output" "${scenario_result_root}/scenario.log" 160
++    print_file_tail "vLLM server log" "${scenario_result_root}/server.log" 160
++    print_file_tail "runner preflight failure" "${scenario_result_root}/runner_preflight_failure.txt" 80
++    print_file_tail "node environment failure" "${scenario_result_root}/node_env_failure.txt" 80
++    echo "::endgroup::"
++  done < "$summary_file"
++fi
++
+ exit "$overall_exit_code"
+diff --git a/tests/ci/test_ascend_benchmark_workflow_static.py b/tests/ci/test_ascend_benchmark_workflow_static.py
+index 15013e47c314..e5b5db609400 100644
+--- a/tests/ci/test_ascend_benchmark_workflow_static.py
++++ b/tests/ci/test_ascend_benchmark_workflow_static.py
+@@ -10,12 +10,20 @@
+     Path(__file__).resolve().parents[2]
+     / ".github/workflows/ascend-benchmark-leaderboard.yml"
+ )
++RUNNER_SCRIPT_PATH = (
++    Path(__file__).resolve().parents[2]
++    / ".github/workflows/scripts/run_ascend_benchmark_scenario_list.sh"
++)
+ 
+ 
+ def workflow_text() -> str:
+     return WORKFLOW_PATH.read_text(encoding="utf-8")
+ 
+ 
++def runner_script_text() -> str:
++    return RUNNER_SCRIPT_PATH.read_text(encoding="utf-8")
++
++
+ def workflow_yaml() -> dict:
+     return yaml.safe_load(workflow_text())
+ 
+@@ -203,6 +211,19 @@ def test_schedule_runs_registered_multi_scenario_benchmark_publish():
+         assert scenario in text
+ 
+ 
++def test_multi_scenario_runner_prints_failure_diagnostics():
++    text = runner_script_text()
++
++    assert "scenario.log" in text
++    assert ') 2>&1 | tee "$scenario_log"' in text
++    assert "scenario_exit_code=${PIPESTATUS[0]}" in text
++    assert "print_multi_scenario_summary" in text
++    assert "Failed Ascend benchmark scenario diagnostics" in text
++    assert 'print_file_tail "scenario output"' in text
++    assert 'print_file_tail "vLLM server log"' in text
++    assert 'print_file_tail "runner preflight failure"' in text
++
++
+ def test_benchmark_script_does_not_force_max_model_len():
+     script = (
+         Path(__file__).resolve().parents[2]
+@@ -477,6 +498,7 @@ def test_ascend_torch_stack_is_installed_before_preinstall_preflight():
+     )
+     assert "import torch" in ensure_script
+     assert "import torch_npu" in ensure_script
++    assert "torch_npu probe failed" in text
+ 
+ 
+ def test_l2_targeted_scenario_registry_is_covered_by_parser_tests():
+
+From e46d265d4962864a36aa95bc70ca0d06ed93ad15 Mon Sep 17 00:00:00 2001
+From: luoxiaohei <luoxiaohei@ppio.com>
+Date: Mon, 20 Jul 2026 10:38:53 +0800
+Subject: [PATCH 3/3] ci: avoid curl library conflicts in Ascend E2E
+
+Assisted-by: OpenAI Codex
+---
+ .../scripts/run_e2e_inference_regression.sh   | 56 ++++++++++++++-----
+ .../workflows/scripts/run_e2e_serve_smoke.sh  | 49 ++++++++++++----
+ .../ci/test_ascend_benchmark_script_static.py |  9 ++-
+ 3 files changed, 85 insertions(+), 29 deletions(-)
+
+diff --git a/.github/workflows/scripts/run_e2e_inference_regression.sh b/.github/workflows/scripts/run_e2e_inference_regression.sh
+index 3e19859e1d3a..e1ae135474bb 100644
+--- a/.github/workflows/scripts/run_e2e_inference_regression.sh
++++ b/.github/workflows/scripts/run_e2e_inference_regression.sh
+@@ -420,7 +420,35 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_request() {
++  local method=$1
++  local url=$2
++  local payload=${3:-}
++
++  "$PYTHON_BIN" - "$method" "$url" "$payload" <<'PY'
++import os
++import sys
++import urllib.error
++import urllib.request
++
++method, url, payload = sys.argv[1:4]
++data = payload.encode("utf-8") if payload else None
++request = urllib.request.Request(url, data=data, method=method)
++if data is not None:
++    request.add_header("Content-Type", "application/json")
++
++opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++timeout = float(os.environ.get("E2E_HTTP_REQUEST_TIMEOUT_SECONDS", "10"))
++try:
++    with opener.open(request, timeout=timeout) as response:
++        sys.stdout.buffer.write(response.read())
++except (OSError, urllib.error.URLError) as exc:
++    print(f"HTTP request failed: {exc}", file=sys.stderr)
++    raise SystemExit(1) from None
++PY
++}
++
++http_request_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+@@ -429,20 +457,20 @@ curl_with_server_log() {
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if http_request "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP client exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP client exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -504,7 +532,7 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if http_request GET "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -523,15 +551,14 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_request_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+-  "http://$HOST:$PORT/v1/models" >/dev/null
++  GET "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
+-  "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
++http_request_with_server_log "vLLM completions request" \
++  POST "http://$HOST:$PORT/v1/completions" \
++  "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+@@ -554,10 +581,9 @@ PY
+ rm -f "$completion_response"
+ 
+ chat_response=$(mktemp)
+-curl_with_server_log "vLLM chat completions request" \
+-  "http://$HOST:$PORT/v1/chat/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
++http_request_with_server_log "vLLM chat completions request" \
++  POST "http://$HOST:$PORT/v1/chat/completions" \
++  "{\"model\": \"$MODEL_NAME\", \"messages\": [{\"role\": \"user\", \"content\": \"$CHAT_MESSAGE\"}], \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$chat_response"
+ 
+ "$PYTHON_BIN" - "$chat_response" "$MODEL_NAME" <<'PY'
+diff --git a/.github/workflows/scripts/run_e2e_serve_smoke.sh b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+index 2d9f7129bbb0..92b07484f4c8 100644
+--- a/.github/workflows/scripts/run_e2e_serve_smoke.sh
++++ b/.github/workflows/scripts/run_e2e_serve_smoke.sh
+@@ -417,7 +417,35 @@ print_server_log_tail() {
+   fi
+ }
+ 
+-curl_with_server_log() {
++http_request() {
++  local method=$1
++  local url=$2
++  local payload=${3:-}
++
++  "$PYTHON_BIN" - "$method" "$url" "$payload" <<'PY'
++import os
++import sys
++import urllib.error
++import urllib.request
++
++method, url, payload = sys.argv[1:4]
++data = payload.encode("utf-8") if payload else None
++request = urllib.request.Request(url, data=data, method=method)
++if data is not None:
++    request.add_header("Content-Type", "application/json")
++
++opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
++timeout = float(os.environ.get("E2E_HTTP_REQUEST_TIMEOUT_SECONDS", "10"))
++try:
++    with opener.open(request, timeout=timeout) as response:
++        sys.stdout.buffer.write(response.read())
++except (OSError, urllib.error.URLError) as exc:
++    print(f"HTTP request failed: {exc}", file=sys.stderr)
++    raise SystemExit(1) from None
++PY
++}
++
++http_request_with_server_log() {
+   local description=$1
+   shift
+   local max_attempts=${E2E_HTTP_REQUEST_ATTEMPTS:-5}
+@@ -426,20 +454,20 @@ curl_with_server_log() {
+   local rc=0
+ 
+   while [[ "$attempt" -le "$max_attempts" ]]; do
+-    if curl -fsS "$@"; then
++    if http_request "$@"; then
+       return 0
+     else
+       rc=$?
+     fi
+ 
+     if [[ -n "$server_pid" ]] && ! kill -0 "$server_pid" 2>/dev/null; then
+-      echo "$description failed because the vLLM server exited (curl exit $rc)" >&2
++      echo "$description failed because the vLLM server exited (HTTP client exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+ 
+     if [[ "$attempt" -eq "$max_attempts" ]]; then
+-      echo "$description failed after ${max_attempts} attempts (curl exit $rc)" >&2
++      echo "$description failed after ${max_attempts} attempts (HTTP client exit $rc)" >&2
+       print_server_log_tail
+       return "$rc"
+     fi
+@@ -501,7 +529,7 @@ fi
+ start_server
+ 
+ for attempt in $(seq 1 120); do
+-  if curl -fsS "http://$HOST:$PORT/v1/models" >/dev/null; then
++  if http_request GET "http://$HOST:$PORT/v1/models" >/dev/null 2>&1; then
+     break
+   fi
+ 
+@@ -520,15 +548,14 @@ for attempt in $(seq 1 120); do
+   sleep 2
+ done
+ 
+-curl_with_server_log \
++http_request_with_server_log \
+   "vLLM models endpoint readiness confirmation" \
+-  "http://$HOST:$PORT/v1/models" >/dev/null
++  GET "http://$HOST:$PORT/v1/models" >/dev/null
+ 
+ completion_response=$(mktemp)
+-curl_with_server_log "vLLM completions request" \
+-  "http://$HOST:$PORT/v1/completions" \
+-  -H "Content-Type: application/json" \
+-  -d "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
++http_request_with_server_log "vLLM completions request" \
++  POST "http://$HOST:$PORT/v1/completions" \
++  "{\"model\": \"$MODEL_NAME\", \"prompt\": \"$PROMPT\", \"max_tokens\": $MAX_TOKENS, \"temperature\": 0}" \
+   > "$completion_response"
+ 
+ "$PYTHON_BIN" - "$completion_response" "$MODEL_NAME" <<'PY'
+diff --git a/tests/ci/test_ascend_benchmark_script_static.py b/tests/ci/test_ascend_benchmark_script_static.py
+index 0989f5101f04..5d7e3d4c6557 100644
+--- a/tests/ci/test_ascend_benchmark_script_static.py
++++ b/tests/ci/test_ascend_benchmark_script_static.py
+@@ -86,13 +86,16 @@ def test_e2e_inference_scripts_retry_http_requests_and_print_server_log():
+         text = script_text(script_name)
+ 
+         assert "print_server_log_tail() {" in text
+-        assert "curl_with_server_log() {" in text
++        assert "http_request() {" in text
++        assert "http_request_with_server_log() {" in text
++        assert "urllib.request.ProxyHandler({})" in text
+         assert "E2E_HTTP_REQUEST_ATTEMPTS" in text
++        assert "E2E_HTTP_REQUEST_TIMEOUT_SECONDS" in text
+         assert "else\n      rc=$?\n    fi" in text
+         assert "failed after ${max_attempts} attempts" in text
+-        assert 'done\n\ncurl -fsS "http://$HOST:$PORT/v1/models" >/dev/null' not in text
++        assert "curl -fsS" not in text
+         assert "vLLM models endpoint readiness confirmation" in text
+         assert (
+-            "curl_with_server_log"
++            "http_request_with_server_log"
+             in text[text.index("completion_response=$(mktemp)") :]
+         )

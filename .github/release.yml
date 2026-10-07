@@ -1,0 +1,79 @@
+name: Release to PyPI
+
+# Tag-triggered publication following the vLLM-HUST packaging and
+# release guide (operations/bidkv-packaging-and-release-guide.md):
+#   uv build --no-sources -> verify wheel -> uv publish -> smoke install
+# build/test/publish share one commit; the version is read from
+# package metadata, never hardcoded. Release approval is owner-led
+# (see MAINTAINERS.md).
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Record provenance
+        run: |
+          mkdir -p dist
+          git log -1 --format="commit %H%nsubject %s" | tee dist/provenance.txt
+          echo "tag ${GITHUB_REF}" >> dist/provenance.txt
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Build distributions
+        run: uv build --no-sources --out-dir dist
+      - name: Verify wheel contents
+        run: bash scripts/verify-wheel.sh dist/*.whl
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # trusted publishing; token below as fallback
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Publish to PyPI
+        if: ${{ secrets.UV_PUBLISH_TOKEN != '' }}
+        run: |
+          uv publish \
+            --check-url https://pypi.org/simple/vllm-hust-knorm/ \
+            --token "pypi-${{ secrets.UV_PUBLISH_TOKEN }}" \
+            dist/*.whl dist/*.tar.gz
+      - name: Smoke install from PyPI (no cache)
+        if: ${{ secrets.UV_PUBLISH_TOKEN != '' }}
+        env:
+          RELEASE_VERSION: ${{ github.ref_name }}
+        run: |
+          python -m venv .release-smoke
+          .release-smoke/bin/python -m pip install --no-cache-dir \
+            --refresh-package vllm-hust-knorm \
+            "vllm-hust-knorm==${RELEASE_VERSION#v}"
+          .release-smoke/bin/python - <<'PY'
+          import os
+          import importlib.metadata as im
+          import vllm_hust_knorm
+
+          expected = os.environ["RELEASE_VERSION"].lstrip("v")
+          assert vllm_hust_knorm.__version__ == expected, vllm_hust_knorm.__version__
+          assert im.version("vllm-hust-knorm") == expected
+          print("PyPI smoke OK:", expected)
+          PY
