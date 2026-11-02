@@ -1,5 +1,7 @@
 # vLLM-HUST KNorm
 
+**English** | [简体中文](README.zh-CN.md)
+
 Token-level KNorm KV-cache compression with a CPU reference runtime and a
 candidate Ascend backend. Each layer and KV head independently retains the
 lowest key-norm tokens. The first two layers remain uncompressed. Surviving
@@ -109,27 +111,29 @@ performance require separate validation on a selected host stack.
 
 ## Historical device evidence
 
-以下仅记录旧块级实现，不代表当前 token 运行时通过宿主或 NPU 验证。
+The following records apply only to the historical block-level implementation.
+They do not establish host or NPU validation for the current token-level runtime.
 
-2026-09-18 真机端到端验收（910B2，eager 模式；证据与日志路径见
-[docs/how-to-run.md](docs/how-to-run.md) §11）：
+End-to-end device validation on 2026-09-18 (910B2, eager mode; evidence and log
+locations are listed in [docs/how-to-run.md](docs/how-to-run.md) §11):
 
-| 项目 | 已验证值 |
-|---|---|
-| 插件 commit / 安装方式 | `45e9157`，editable（验收发布需换 wheel 重跑） |
-| vLLM-HUST commit | `f18cf803c5`（detached；静态基线 `main@8344e107`） |
-| vLLM-Ascend-HUST / triton-ascend | `17ed0571d`（`sync/upstream-main-20260908-latest`）/ `ef6c29210` |
-| 设备 / 模型 | Ascend 910B2 单卡；Qwen2.5-14B-Instruct BF16 |
-| 关键参数 | `--enforce-eager --gpu-memory-utilization 0.85 --max-model-len 8192 --no-enable-prefix-caching`，`VLLM_VERSION=0.23.1` |
-| 安装无副作用 / 关闭对照 | READY 50s，HTTP 200，仅 bootstrap 标记 ✓ |
-| 激活标记（manager + wrapper 同现） | `knorm-manager-registered`（5 spec）+ `knorm-wrapper-installed` ✓ |
-| 请求 / 淘汰路径 | 短请求 HTTP 200；6640-token 长上下文触发淘汰零错误、摘要正确 ✓ |
-| prefix-caching 互斥对照 | 告警出现、manager 不重定向、HTTP 200 ✓ |
-| matched-baseline 吞吐（≥3 runs） | **pending** |
-| graph 模式 / 多卡 / 长稳 | **pending** |
+| Item | Validated value |
+| --- | --- |
+| Plugin commit / installation | `45e9157`, editable (release validation requires a rerun with a wheel) |
+| vLLM-HUST commit | `f18cf803c5` (detached; static baseline `main@8344e107`) |
+| vLLM-Ascend-HUST / triton-ascend | `17ed0571d` (`sync/upstream-main-20260908-latest`) / `ef6c29210` |
+| Device / model | Single Ascend 910B2; Qwen2.5-14B-Instruct BF16 |
+| Key arguments | `--enforce-eager --gpu-memory-utilization 0.85 --max-model-len 8192 --no-enable-prefix-caching`, `VLLM_VERSION=0.23.1` |
+| Side-effect-free installation / disabled control | READY in 50s, HTTP 200, bootstrap marker only ✓ |
+| Activation markers (manager and wrapper together) | `knorm-manager-registered` (5 specs) + `knorm-wrapper-installed` ✓ |
+| Request / eviction path | Short request: HTTP 200; 6640-token context: eviction without errors and correct summary ✓ |
+| Prefix-caching mutual-exclusion control | Warning emitted, manager not redirected, HTTP 200 ✓ |
+| Matched-baseline throughput (≥3 runs) | **pending** |
+| Graph mode / multiple devices / long-running stability | **pending** |
 
-宿主栈注意事项：该组合需要 `_triton_compat.py` gluon 热修（宿主自身
-bug，与插件无关；对照实验与重放步骤见 how-to-run.md §10）。
+Host stack note: this combination requires a `_triton_compat.py` gluon hotfix
+for a host bug unrelated to the plugin. Control experiments and reproduction
+steps are documented in how-to-run.md §10.
 
 ## Canonical MOD metadata
 
