@@ -1,5 +1,10 @@
 # 服务器验证 workflow（How to run）
 
+> **历史实现说明：** 本文主体描述旧块级实现，保留用于追溯及历史回归。
+> 当前 token 级实现的公开 API、CPU 示例和配置迁移见 [README](../README.md)。
+> 当前仅允许 import-only 注册，不安装旧补丁；旧配置变量及显式启用均被拒绝。
+> 下文的旧环境示例、激活辅助函数和宿主路径不适用于当前实现。
+
 在 Ascend 910B（或 CUDA GPU）服务器上对 `vllm-hust-knorm` 做端到端
 验证。目标：证明"插件被宿主真正加载、KNorm 真正生效、可关闭、可
 回退、性能结论有 matched baseline"——"进程启动成功"不算验收。

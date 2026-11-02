@@ -68,13 +68,14 @@ class TestBootstrap:
 
 
 class TestActivationPipeline:
-    def test_activate_installs_patches_once(self, fake_host):
+    def test_activate_registers_import_only_once(self, fake_host):
         first = activation.activate()
         second = activation.activate()
 
         assert first["status"] == "registered"
         assert first["extension_id"] == "org.vllm-hust.knorm"
-        assert first["patches"]["spec_registration"] is True
+        assert first["integration"] == "import_only"
+        assert first["patches"] == {}
         assert second["status"] == "already_activated"
 
     def test_facade_activate_matches_pipeline(self, fake_host):

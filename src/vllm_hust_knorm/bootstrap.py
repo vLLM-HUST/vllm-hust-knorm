@@ -1,18 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
-"""``vllm.general_plugins`` dynamic-load entry point.
+"""Discovery hook: import-only registration in hosts, no-op elsewhere.
 
-After installation, vLLM imports this entry point in every process
-(process 0, engine core and workers) during plugin loading, and calls
-``register_plugins()``. Registration installs the runtime patches but
-does not enable compression: only ``VLLM_KNORM_ENABLED=1`` (plus
-prefix caching disabled) activates Knorm.
-
-Failure mode: when this process is not a vllm host the hook is a no-op;
-when the host conflicts with an in-tree ``vllm.knorm`` or lacks the
-required surfaces, activation raises and vLLM logs the exception —
-fail closed, never a silent half-install.
+No compression hooks are installed until a concrete host binding is verified.
 """
 
 from __future__ import annotations
@@ -31,8 +22,8 @@ def register_plugins() -> list[str]:
 
     info = activate()
     print(
-        "[vllm-hust-knorm] runtime patches registered; activate with "
-        "VLLM_KNORM_ENABLED=1 and --no-enable-prefix-caching "
+        "[vllm-hust-knorm] knorm-import-only-registered; "
+        "VLLM_KNORM_ENABLED=1 is unavailable pending host validation "
         f"(status={info.get('status')})",
         flush=True,
     )

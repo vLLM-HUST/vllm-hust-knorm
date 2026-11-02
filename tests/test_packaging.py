@@ -78,3 +78,84 @@ def test_wheel_metadata_carries_entry_points_and_version(tmp_path: Path):
     assert (
         "vllm-hust-knorm = vllm_hust_knorm.bootstrap:register_plugins" in entry_points
     )
+
+
+def test_installed_wheel_public_configuration_and_activation_gate(tmp_path: Path):
+    out = build_distributions(tmp_path)
+    (wheel_path,) = out.glob("*.whl")
+    environment = tmp_path / "installed"
+    subprocess.run([sys.executable, "-m", "venv", str(environment)], check=True)
+    python = environment / "bin" / "python"
+    installed = subprocess.run(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--no-index",
+            "--no-deps",
+            str(wheel_path),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert installed.returncode == 0, installed.stdout + installed.stderr
+    code = """
+import os
+import sys
+import vllm_hust_knorm as package
+from vllm_hust_knorm import KNormConfig, KnormConfig, should_activate
+from vllm_hust_knorm.runtime.engine import Simulation
+
+for name in tuple(os.environ):
+    if name.startswith("VLLM_KNORM_"):
+        del os.environ[name]
+assert "site-packages" in package.__file__
+assert not {"torch", "torch_npu", "vllm", "vllm_hust_knorm.knorm"}.intersection(
+    sys.modules
+)
+for mode in ("once", "repeat"):
+    config = KNormConfig(mode=mode, prune_after=4, keep_ratio="0.5")
+    assert config.budget(9) == 5
+    sim = Simulation(config, block_size=4)
+    request = sim.create("installed", 8)
+    sim.append(request, range(8), lambda l, h, t, p: ((float(p),), (float(t),)))
+    sim.controller.before_decode(request)
+    assert [layout.length for layout in request.layers.values()] == [8, 8, 4, 4]
+for call, exception, message in (
+    (lambda: KNormConfig(), TypeError, "required positional arguments"),
+    (lambda: KnormConfig(), TypeError, "use KNormConfig"),
+    (lambda: KnormConfig(compression_ratio=0.5), TypeError, "use KNormConfig"),
+    (lambda: should_activate(False), RuntimeError, "should_activate was removed"),
+    (lambda: KNormConfig(mode="once", prune_after=4, keep_ratio="0.5",
+                        warmup_tokens=32), TypeError, "warmup_tokens"),
+):
+    try:
+        call()
+    except exception as error:
+        assert message in str(error)
+    else:
+        raise AssertionError("legacy or implicit configuration was accepted")
+os.environ["VLLM_KNORM_ENABLED"] = "1"
+try:
+    package.activate()
+except RuntimeError as error:
+    assert "import_only" in str(error)
+else:
+    raise AssertionError("runtime enablement was accepted")
+os.environ["VLLM_KNORM_ENABLED"] = "0"
+os.environ["VLLM_KNORM_COMPRESSION_RATIO"] = "0.5"
+try:
+    package.activate()
+except ValueError as error:
+    assert "legacy" in str(error)
+else:
+    raise AssertionError("legacy environment was accepted")
+"""
+    result = subprocess.run(
+        [str(python), "-I", "-c", code],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

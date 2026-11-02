@@ -17,7 +17,10 @@ for required in \
   'vllm_hust_knorm/bootstrap.py' \
   'vllm_hust_knorm/core/hosts.py' \
   'vllm_hust_knorm/adapters/vllm_hust/patches.py' \
-  'vllm_hust_knorm/knorm/manager.py' \
+  'vllm_hust_knorm/algorithm/packing.py' \
+  'vllm_hust_knorm/runtime/transaction.py' \
+  'vllm_hust_knorm/runtime/recovery.py' \
+  'vllm_hust_knorm/backends/ascend/cache.py' \
   'vllm_hust_knorm/manifests/__init__.py' \
   'vllm_hust_knorm/manifests/vllm-hust-extension-v0.3.json' \
   '.dist-info/entry_points.txt' \

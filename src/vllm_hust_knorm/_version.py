@@ -10,4 +10,4 @@ after every code change that is published (see
 docs/packaging-and-release.md).
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0a1"

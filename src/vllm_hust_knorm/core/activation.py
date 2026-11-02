@@ -1,19 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
-"""Unified activation pipeline: guards → host adapter → register().
+"""Single import-only registration gate shared by bootstrap and facade.
 
-This is the single path that lights the plugin up inside a host
-process, shared by two entry points:
-
-- the ``vllm.general_plugins`` bootstrap hook (host-invoked), and
-- the programmatic facade ``vllm_hust_knorm.activate()``.
-
-Fail-closed semantics: an in-tree ``vllm.knorm`` conflict, a missing
-host stack, or missing host surfaces raise immediately; nothing is
-silently skipped. Registering patches does not enable compression —
-``VLLM_KNORM_ENABLED`` still gates behavior, exactly like the reference
-plugin's “register ≠ enable” split.
+Runtime activation is rejected until a verified host binding exists. Archived
+legacy patches are never installed by this pipeline.
 """
 
 from __future__ import annotations
@@ -28,6 +19,9 @@ _activated = False
 def activate() -> dict[str, Any]:
     """Install the host integration once and return a status dict."""
     global _activated
+    from ..config import validate_environment
+
+    validate_environment()
     if _activated:
         return {"status": "already_activated", "extension_id": _extension_id()}
 

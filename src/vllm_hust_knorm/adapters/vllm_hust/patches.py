@@ -4,25 +4,25 @@
 """Idempotent runtime patches binding Knorm into vLLM-HUST v1 core.
 
 The archived in-tree integration (legacy PRs #76/#134/#214) edited the
-host files directly. As a plugin we install the same integration as
-wrappers at the ``vllm.general_plugins`` load point:
+host files directly. This module preserves the legacy wrappers for
+historical regression coverage; the plugin entry point no longer installs them:
 
-P1  ``FreeQueue.prependleft_n`` — additive queue op (PR #76).
-P2  ``BlockPool.free_blocks(prepend=)`` — head-of-queue freeing for
+- ``FreeQueue.prependleft_n`` — additive queue op (PR #76).
+- ``BlockPool.free_blocks(prepend=)`` — head-of-queue freeing for
     uncached evicted blocks (PR #76).
-P3  ``register_all_kvcache_specs`` — re-register full-attention specs
+- ``register_all_kvcache_specs`` — re-register full-attention specs
     with ``KnormFullAttentionManager`` when :func:`should_activate`
     agrees, warn when prefix caching blocks Knorm (PRs #134/#214).
     The host registry resolves this function lazily inside
     ``KVCacheSpecRegistry._ensure_registered``, and general plugins load
     before the first registration, so the module-attribute wrap is
     effective.
-P4  ``Scheduler.update_from_output`` — route ``knorm_block_scores``
+- ``Scheduler.update_from_output`` — route ``knorm_block_scores``
     from the model runner output into the manager bridge (PR #76).
-P5  ``GPUModelRunner.__init__`` — compute ``_knorm_active`` from the
+- ``GPUModelRunner.__init__`` — compute ``_knorm_active`` from the
     same single source of truth and install the attention wrapper
     before the first forward (PR #214 guards).
-P6  ``GPUModelRunner.sample_tokens`` — collect per-block scores after
+- ``GPUModelRunner.sample_tokens`` — collect per-block scores after
     the forward and attach them to the runner output (PR #76/#214).
 
 Every patch carries a marker and is a no-op on re-install. The patches
@@ -124,7 +124,7 @@ def _queue_prepend_method(queue: Any) -> Callable[[list], None]:
 
 
 def _install_free_queue_prepend(free_queue_cls: type) -> bool:
-    """P1: ensure the queue supports head insertion (idempotent).
+    """Ensure the queue supports head insertion (idempotent).
 
     Hosts with a native ``prepend_n`` (current main) or
     ``prependleft_n`` (0.23 seam era) need nothing; older shapes get
@@ -171,7 +171,7 @@ def _install_free_queue_prepend(free_queue_cls: type) -> bool:
 
 
 def _install_free_blocks_prepend(block_pool_cls: type) -> bool:
-    """P2: teach ``free_blocks`` the ``prepend`` keyword.
+    """Teach ``free_blocks`` the ``prepend`` keyword.
 
     Hosts that already ship the in-tree signature (0.23 seam era) are
     detected by signature and left untouched.
@@ -242,7 +242,7 @@ def _override_full_attention_specs(registry_module: Any) -> list[str]:
 def _install_spec_registration_patch(
     single_type_module: Any, registry_module: Any
 ) -> bool:
-    """P3: wrap ``register_all_kvcache_specs`` at every binding site.
+    """Wrap ``register_all_kvcache_specs`` at every binding site.
 
     Manager registration follows :func:`should_activate` — the same
     single source of truth the runner-side guard uses — so the
@@ -292,7 +292,7 @@ def _install_spec_registration_patch(
 
 
 def _install_scheduler_score_routing(scheduler_cls: type) -> bool:
-    """P4: route ``knorm_block_scores`` into the manager bridge."""
+    """Route ``knorm_block_scores`` into the manager bridge."""
     from ...knorm.manager import submit_block_scores
 
     def build(original: Callable[..., Any]) -> Callable[..., Any]:
@@ -311,7 +311,7 @@ def _install_scheduler_score_routing(scheduler_cls: type) -> bool:
 
 
 def _install_runner_init_patch(runner_cls: type) -> bool:
-    """P5: compute ``_knorm_active`` once and install the wrapper early."""
+    """Compute ``_knorm_active`` once and install the wrapper early."""
 
     def build(original: Callable[..., Any]) -> Callable[..., Any]:
         from ...knorm.attention_backend import install_attention_wrapper
@@ -356,7 +356,7 @@ def _is_last_pp_rank() -> bool:
 
 
 def _install_runner_sample_patch(runner_cls: type) -> bool:
-    """P6: collect scores after the forward, attach to the output."""
+    """Collect scores after the forward, attach to the output."""
 
     def build(original: Callable[..., Any]) -> Callable[..., Any]:
         from ...knorm.hooks import attach_knorm_scores, collect_knorm_scores

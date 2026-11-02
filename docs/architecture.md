@@ -1,5 +1,10 @@
 # Architecture
 
+> **历史实现说明：** 本文主体描述旧块级实现，保留用于追溯及历史回归。
+> 当前 token 级实现的公开 API、CPU 示例和配置迁移见 [README](../README.md)。
+> 当前仅允许 import-only 注册，不安装旧补丁；旧配置变量及显式启用均被拒绝。
+> 下文的旧环境示例、激活辅助函数和宿主路径不适用于当前实现。
+
 KNorm as an extension bundle: one implementation, two activation
 surfaces, zero host-file edits.
 

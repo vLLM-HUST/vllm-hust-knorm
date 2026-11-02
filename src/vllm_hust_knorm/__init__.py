@@ -1,43 +1,47 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
-"""KNorm KV-cache compression for vLLM-HUST, as an installable plugin.
+"""Token-level KNorm configuration and import-only plugin registration.
 
-Importing this package is lazy and side-effect free: no torch, no vllm,
-no device access, no global registry writes. The device and host paths
-load only when the corresponding functions run.
+Importing the package does not load torch, vLLM, or the legacy implementation.
+Configure the CPU runtime explicitly::
 
-Quick start::
+    from vllm_hust_knorm import KNormConfig
 
-    from vllm_hust_knorm import knorm
+    config = KNormConfig(mode="once", prune_after=4096, keep_ratio="0.5")
 
-    knorm.KnormConfig()            # validated snapshot of VLLM_KNORM_*
-    knorm.should_activate(False)   # single source of truth
-    vllm_hust_knorm.activate()     # install host patches (host process)
-
-Layering (see docs/architecture.md)::
-
-    knorm.config / norms / eviction  pure, any process, CPU-testable
-    knorm.attention_backend / hooks  torch paths, lazy imports
-    knorm.manager                    host subclass, built lazily
-    core                             host detection + activation pipeline
-    adapters                         host patches (fail closed)
-    bootstrap                        vllm.general_plugins hook
-
-Provenance: migrated from the archived vllm-hust tree, legacy PRs #76,
-#134 and #214 — see PROVENANCE.md and provenance/legacy-patches/.
+These values are illustrative, not evaluated model defaults. Host activation
+remains unavailable until a concrete binding is verified. Historical source
+and provenance are retained separately; legacy configuration is not mapped
+onto token-level semantics.
 """
 
 from ._version import __version__
-from .knorm import KnormConfig, should_activate
+from .config import KNormConfig
 
 
 def activate() -> dict:
-    """Install the host integration (same pipeline as the bootstrap
-    hook); raises RuntimeError outside a compatible vLLM-HUST host."""
+    """Register import-only discovery in a host; runtime enablement is rejected."""
     from .core.activation import activate as _activate
 
     return _activate()
 
 
-__all__ = ["KnormConfig", "__version__", "activate", "should_activate"]
+def KnormConfig(*args, **kwargs):
+    """Reject the former block-level configuration with migration guidance."""
+    raise TypeError(
+        "KnormConfig was removed: use KNormConfig(mode=..., prune_after=..., "
+        "keep_ratio=...) with explicit token-level settings. Legacy block ratios "
+        "and protection windows cannot be mapped automatically."
+    )
+
+
+def should_activate(*args, **kwargs):
+    """Reject the legacy enablement predicate; host registration owns the gate."""
+    raise RuntimeError(
+        "should_activate was removed: activate() owns host registration; "
+        "runtime enablement remains import_only pending host validation."
+    )
+
+
+__all__ = ["KNormConfig", "__version__", "activate"]

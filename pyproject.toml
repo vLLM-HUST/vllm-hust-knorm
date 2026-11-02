@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vllm-hust-knorm"
-description = "KNorm key-L2-norm KV-cache compression for vLLM-HUST, as a runtime-loadable extension bundle"
+description = "Token-level KNorm runtime and candidate Ascend backend; host integration is import-only"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -34,8 +34,8 @@ dev = [
 ]
 
 # Runtime plugin hook. vLLM calls it in every process during plugin
-# loading; registration installs the patches, VLLM_KNORM_ENABLED=1 is
-# the explicit activation switch.
+# loading; registration is import-only and installs no compression patches.
+# VLLM_KNORM_ENABLED=1 is rejected until a host binding is verified.
 [project.entry-points."vllm.general_plugins"]
 "vllm-hust-knorm" = "vllm_hust_knorm.bootstrap:register_plugins"
 

@@ -33,8 +33,8 @@ class TestInstallIdempotency:
         info = install_patches()
         assert info["already_installed"] is False
         # The fake host mirrors vllm-hust main: the free-block queue
-        # ships a native prepend_n, so P1 correctly reports "nothing to
-        # add"; every wrap-based patch applies.
+        # ships a native prepend_n, so no queue method needs to be added;
+        # every wrap-based patch applies.
         assert info["patches"]["free_queue_head_insertion"] is False
         for key in (
             "block_pool_free_blocks_prepend",
@@ -68,8 +68,8 @@ class TestQueueAndFreeBlocks:
         assert queue.num_free_blocks == 2
 
     def test_legacy_queue_gets_prependleft_n_added(self, fake_host):
-        # 0.23-seam-era FreeQueue without head insertion: P1 must add
-        # prependleft_n and P2 must route through it.
+        # A legacy FreeQueue without head insertion needs prependleft_n;
+        # the block-pool freeing wrapper must route through that method.
         legacy_cls = fake_host["make_legacy_queue"]()
         host_module("vllm.v1.core.kv_cache_utils").FreeKVCacheBlockQueue = None
         host_module("vllm.v1.core.kv_cache_utils").FreeQueue = legacy_cls
@@ -121,7 +121,7 @@ class TestQueueAndFreeBlocks:
 
 
 class TestSpecRegistration:
-    """P3 — migrated combination coverage from PRs #134/#214."""
+    """Cache-spec registration combinations migrated from PRs #134/#214."""
 
     def run_registration(self, fake_host, config):
         registry = fake_host["registry"]

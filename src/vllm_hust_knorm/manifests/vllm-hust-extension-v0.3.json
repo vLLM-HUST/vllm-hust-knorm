@@ -1,7 +1,7 @@
 {
   "schema_version": "0.3-experimental",
   "extension_id": "org.vllm-hust.knorm",
-  "extension_version": "0.1.0",
+  "extension_version": "0.2.0a1",
   "kind": "in_process_plugin",
   "host": {
     "provider": "vllm",
@@ -52,7 +52,7 @@
       "contracts": ["vllm.kv_cache.compression.v1"],
       "execution_planes": ["scheduler", "worker"],
       "isolation": "trusted_in_process",
-      "implementation_ref": "vllm_hust_knorm.knorm.manager:get_knorm_manager_class",
+      "implementation_ref": "vllm_hust_knorm.runtime.transaction:Transactions",
       "permissions": []
     },
     {
@@ -60,7 +60,7 @@
       "contracts": ["vllm.attention.norm_collection.v1"],
       "execution_planes": ["worker", "device"],
       "isolation": "trusted_in_process",
-      "implementation_ref": "vllm_hust_knorm.knorm.attention_backend:install_attention_wrapper",
+      "implementation_ref": "vllm_hust_knorm.backends.ascend.cache:AscendCache",
       "permissions": ["device_access"]
     }
   ],
@@ -72,9 +72,7 @@
       }
     ],
     "environment": {
-      "VLLM_KNORM_ENABLED": "1",
-      "VLLM_KNORM_COMPRESSION_RATIO": "0.5",
-      "VLLM_KNORM_WARMUP_TOKENS": "32"
+      "VLLM_KNORM_ENABLED": "1"
     },
     "additional_config": {}
   }
