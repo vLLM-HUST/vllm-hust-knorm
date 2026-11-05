@@ -1,0 +1,20 @@
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -36,5 +36,5 @@
+ 
+ arctic-inference==0.1.1
+ transformers==5.14.1
+-fastapi<0.124.0
++fastapi[standard]>=0.133.0,<0.137.0
+ fastokens==0.2.0
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -26,7 +26,7 @@
+     "quart",
+     "numba",
+     "xgrammar>=0.1.30",
+-    "fastapi<0.124.0",
++    "fastapi[standard]>=0.133.0,<0.137.0",
+     "fastokens==0.2.0",
+     "compressed_tensors>=0.11.0",
+     "arctic-inference==0.1.1",

@@ -1,0 +1,46 @@
+{
+  "artifacts": [
+    {
+      "component": "CANN Toolkit",
+      "version": "9.2.1",
+      "architecture": "aarch64",
+      "filename": "Ascend-cann-toolkit_9.2.1_linux-aarch64.run",
+      "url": "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.2.1/Ascend-cann-toolkit_9.2.1_linux-aarch64.run",
+      "sha256": "1040480caaedb27c5b73e62901403fac3b23836c44409f0c246bc810a017dbe8"
+    },
+    {
+      "component": "FLA NPU A2",
+      "version": "26.9.1",
+      "architecture": "aarch64",
+      "filename": "flash_linear_attention_npu_a2-26.9.1-py3-none-manylinux_2_34_aarch64.whl",
+      "url": "https://mirrors.huaweicloud.com/ascend/repos/pypi/flash-linear-attention-npu-a2/flash_linear_attention_npu_a2-26.9.1-py3-none-manylinux_2_34_aarch64.whl",
+      "sha256": "aefe29fe3f021db45276b289b1f9882f85a34ce1f9900ba94251bda490af4b6e",
+      "checksum_source": "https://api.github.com/repos/flashserve/flash-linear-attention-npu/releases/tags/v26.9.1-release"
+    },
+    {
+      "component": "CANN 910b-ops",
+      "version": "9.2.1",
+      "architecture": "aarch64",
+      "filename": "Ascend-cann-910b-ops_9.2.1_linux-aarch64.run",
+      "url": "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.2.1/Ascend-cann-910b-ops_9.2.1_linux-aarch64.run",
+      "sha256": "b2548ae4e096fdcb4d462c2cb1a9dee78442a6e66a4aff85f4e5ca4fdd621ecd"
+    },
+    {
+      "component": "CANN nnal",
+      "version": "9.2.1",
+      "architecture": "aarch64",
+      "filename": "Ascend-cann-nnal_9.2.1_linux-aarch64.run",
+      "url": "https://ascend-repo.obs.cn-east-2.myhuaweicloud.com/CANN/CANN%209.2.1/Ascend-cann-nnal_9.2.1_linux-aarch64.run",
+      "sha256": "211b2c934dac0206778b5489c148b61ebf85c9f2402a0dd5cf2610fa7778cde0"
+    },
+    {
+      "component": "expecttest",
+      "version": "0.3.0",
+      "architecture": "any",
+      "filename": "expecttest-0.3.0-py3-none-any.whl",
+      "url": "https://files.pythonhosted.org/packages/27/fb/deeefea1ea549273817ca7bed3db2f39cc238a75a745a20e3651619f7335/expecttest-0.3.0-py3-none-any.whl",
+      "sha256": "60f88103086e1754240b42175f622be83b6ffeac419434691ee5a5be819d0544",
+      "checksum_source": "https://pypi.org/pypi/expecttest/0.3.0/json"
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# Additive requirements; keep runtime.lock unchanged and apply it as a constraint.
+# Verified against the upstream release API and the PyPI release JSON.
+flash-linear-attention-npu-a2 @ https://mirrors.huaweicloud.com/ascend/repos/pypi/flash-linear-attention-npu-a2/flash_linear_attention_npu_a2-26.9.1-py3-none-manylinux_2_34_aarch64.whl#sha256=aefe29fe3f021db45276b289b1f9882f85a34ce1f9900ba94251bda490af4b6e
+expecttest @ https://files.pythonhosted.org/packages/27/fb/deeefea1ea549273817ca7bed3db2f39cc238a75a745a20e3651619f7335/expecttest-0.3.0-py3-none-any.whl#sha256=60f88103086e1754240b42175f622be83b6ffeac419434691ee5a5be819d0544

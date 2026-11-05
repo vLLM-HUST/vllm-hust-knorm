@@ -9,7 +9,9 @@ K/V pairs are packed into selected original pages, with independent allocation
 and reclamation per layer.
 
 **Status: experimental, import-only.** The algorithm and simulated runtime can
-be exercised on CPU. A concrete vLLM-HUST/Ascend host binding and device
+be exercised on CPU. A guarded development binding targets the fixed vLLM
+0.30.0 / Ascend 0.30.0 sources; see [host preparation](host-patches/README.md).
+Its host contracts run without devices. Native runner initialization and device
 validation remain outstanding. Installing the plugin does not install legacy
 compression patches. `VLLM_KNORM_ENABLED=1` is rejected, including outside ECPA
 qualification; there is no supported serving command for this implementation.
@@ -85,6 +87,7 @@ src/vllm_hust_knorm/
 ├── runtime/                state, page ownership, transactions and replay
 ├── backends/ascend/        candidate device operations and metadata
 ├── core/                   host guards and import-only registration
+├── adapters/ascend/        pinned host planner, allocator, worker and replay binding
 ├── adapters/vllm_hust/     host contracts and archived legacy wrappers
 ├── bootstrap.py            vllm.general_plugins discovery hook
 ├── manifests/              static extension manifest
@@ -105,7 +108,7 @@ bash scripts/verify-wheel.sh dist/*.whl
 The commands above validate the CPU runtime and packaging.
 [The documentation index](docs/index.md) links to architecture and historical
 device evidence. The old serving workflow
-and host contract describe the historical implementation; their commands do
+describes the historical implementation; its commands do
 not enable the current runtime. Device quality, numerical tolerances and
 performance require separate validation on a selected host stack.
 

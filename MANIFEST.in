@@ -1,0 +1,3 @@
+include HOST_CONTRACT.md
+recursive-include host-patches *.md *.patch *.lock *.json
+recursive-include scripts *.py *.sh

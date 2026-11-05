@@ -70,6 +70,14 @@ class _FakeLogger:
 def build_fake_host() -> dict[str, Any]:
     """Assemble the fake vllm host tree and return its key objects."""
     host: dict[str, Any] = {}
+    # Metadata-only activation tests need module discovery, not runtime types.
+    for name in (
+        "vllm.v1.core.kv_cache_manager",
+        "vllm.v1.core.kv_cache_coordinator",
+        "vllm.v1.engine.core",
+        "vllm.v1.worker.block_table",
+    ):
+        register_module(name)
 
     vllm = register_module("vllm")
     vllm.__path__ = []  # mark as package for submodule lookups
@@ -374,9 +382,11 @@ def fake_host(monkeypatch, clean_knorm_env):
 
 
 @pytest.fixture(autouse=True)
-def restore_sys_modules():
+def restore_sys_modules(request):
     """Drop fake host modules after each test."""
     yield
+    if request.module.__name__ == "test_ascend_host":
+        return
     for name in list(sys.modules):
         if is_host_module(name):
             del sys.modules[name]

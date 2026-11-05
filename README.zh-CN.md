@@ -7,7 +7,9 @@
 保留的 K/V 对紧致存放到选定的原有页中，各层独立分配和回收页。
 
 **当前状态：实验性，仅支持导入注册（import-only）。** 算法和模拟运行时可在 CPU 上运行，
-具体 vLLM-HUST/Ascend 宿主接入及设备验证尚未完成。安装插件不会安装旧压缩补丁。
+现有受保护的开发候选绑定面向固定 vLLM 0.30.0 / Ascend 0.30.0 源码，
+参见[宿主环境准备](host-patches/README.md)。宿主契约可在无设备条件下测试，
+原生 runner 初始化与设备验证仍待完成。安装插件不会安装旧压缩补丁。
 即使不经过 ECPA 资格检查，`VLLM_KNORM_ENABLED=1` 也会被拒绝；
 当前实现尚无受支持的推理服务启动命令。manifest 仍为 `0.3-experimental`，
 实现状态为 `import_only`。
@@ -79,6 +81,7 @@ src/vllm_hust_knorm/
 ├── runtime/                状态、页所有权、事务与重放
 ├── backends/ascend/        候选设备操作与元数据
 ├── core/                   宿主检查与 import-only 注册
+├── adapters/ascend/        固定宿主的规划、分配、worker 与重放绑定
 ├── adapters/vllm_hust/     宿主契约与保留的旧包装器
 ├── bootstrap.py            vllm.general_plugins 发现钩子
 ├── manifests/              静态扩展 manifest
@@ -98,7 +101,7 @@ bash scripts/verify-wheel.sh dist/*.whl
 
 以上命令用于验证 CPU 运行时和打包。
 [文档索引](docs/index.md) 提供架构说明和历史设备证据的链接。
-旧推理服务流程与宿主契约描述的是历史实现，其中的命令不能启用当前运行时。
+旧推理服务流程描述的是历史实现，其中的命令不能启用当前运行时。
 设备上的质量、数值容差和性能需要在选定的宿主栈上单独验证。
 
 ## 历史设备证据

@@ -34,7 +34,8 @@ dev = [
 ]
 
 # Runtime plugin hook. vLLM calls it in every process during plugin
-# loading; registration is import-only and installs no compression patches.
+# loading; default registration is import-only. Candidate wrappers require
+# the separate explicit development entry and pinned-source verification.
 # VLLM_KNORM_ENABLED=1 is rejected until a host binding is verified.
 [project.entry-points."vllm.general_plugins"]
 "vllm-hust-knorm" = "vllm_hust_knorm.bootstrap:register_plugins"
@@ -52,7 +53,7 @@ version = { attr = "vllm_hust_knorm._version.__version__" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-vllm_hust_knorm = ["manifests/*.json"]
+vllm_hust_knorm = ["manifests/*.json", "adapters/ascend/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

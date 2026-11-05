@@ -1,0 +1,23 @@
+{
+  "vllm/v1/core/kv_cache_utils.py": "2666c9f113584e52e7521058efd2c0d9598544559dc942d3a3da87001a3fedf2",
+  "vllm/v1/engine/core.py": "268bf40534a853812867ae8e80040f190983cb364b41182b55969aace20c93f5",
+  "vllm/v1/core/sched/scheduler.py": "c1db45f3bbad3a875dd8638331b8870c4380ac1ab4734265ba5c863833a82884",
+  "vllm_ascend/worker/model_runner_v1.py": "7fdd01b9e77c69a93282a7ca8e63bd80f30b3781e85a62369264efd5c312f75e",
+  "vllm_ascend/worker/worker.py": "9d938de914cb6a8c6366a11ec63b3d3487204bf3d216884e307650e2e2d0c608",
+  "vllm/v1/core/kv_cache_manager.py": "58800535eda854580d84e1025bf32fe01b2a43ce0bba501b4f3d125e4f2c8afa",
+  "vllm/v1/core/kv_cache_coordinator.py": "bf342f79f2bc8d6acb69d3becefb334509e84cae888d42bbd421a8dc8ca9eca3",
+  "vllm/v1/core/single_type_kv_cache_manager.py": "0233531d85aeced9e57a38c76d83db970519c92902b7e55484390cb2b64985bf",
+  "vllm/v1/core/block_pool.py": "34c2fd67148cecb7763ff49ad694a57073759b0fa67572a4270dc995b4acf8fc",
+  "vllm/v1/worker/block_table.py": "a09b8819e1417b7a186cf3472224e2138fc5d41a291c6692bb7df711b0c44259",
+  "vllm/v1/kv_cache_interface.py": "1cf202f1a44d5bc5c3832b70b41507687ecceea3784e67a4f003bc0210d6eecb",
+  "vllm_ascend/patch/platform/patch_kv_cache_utils.py": "5fc49ebb9b64a2f14c4eb38b8c66d3daf1b7612961cf76392cf113d76f555aab",
+  "vllm_ascend/attention/attention_v1.py": "bea4e410f797557e29cedbb495024147606e74b0e056d725194760ca69296eba",
+  "vllm/v1/worker/gpu_input_batch.py": "18cf455c9d0eea61cc581c7932f2e6cd09786914e82dd35eef1c1430da359a0f",
+  "vllm/v1/worker/gpu_model_runner.py": "87c29d08c0bbf66993d8b984811e7325e35e6436242a773feb55ec88f16b2c51",
+  "vllm/v1/core/sched/output.py": "3a66c8efaefe10c572f6f33cf1f8aa4610758c945130cad62eb9f7331005677c",
+  "vllm/v1/attention/backend.py": "01ac364372afa75fdb22486aa3a9c7cf9aebb742e3471dfb9e0f9d9d36b734bc",
+  "vllm/config/cache.py": "f1c226ba679c884930dbfcaf41a57248b137a9a20d3ed8e3d3b31752bb484c07",
+  "vllm/v1/request.py": "da610d5203e72d2d524adc5fb39df11502a23520f2f31d9a44cf13d343f9c25d",
+  "vllm_ascend/worker/npu_input_batch.py": "091187802ece762ecd8a18b1b269dab254f48bf7decc926933cb496ffaf1b870",
+  "vllm_ascend/attention/utils.py": "92d5a59aac2dd02f7ea764ec28a635bce336431dd95a33b2e187d3a1c2da8d47"
+}

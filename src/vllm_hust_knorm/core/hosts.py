@@ -15,18 +15,17 @@ import importlib.util
 
 VLLM_HOST = "vllm"
 
-# Host surfaces the runtime patches bind to. Kept in one place so the
-# contract tests and HOST_CONTRACT.md stay in sync with the adapter.
-# An "attr1|attr2" entry means any one of the alternatives satisfies
-# the contract (host generations renamed the free-block queue class).
+# Import-only discovery probes modules without loading device runtimes. Explicit
+# candidate activation additionally verifies source hashes and effective methods.
 REQUIRED_SURFACES = (
-    "vllm.v1.core.single_type_kv_cache_manager:register_all_kvcache_specs",
-    "vllm.v1.core.single_type_kv_cache_manager:FullAttentionManager",
-    "vllm.v1.kv_cache_spec_registry:KVCacheSpecRegistry",
-    "vllm.v1.core.kv_cache_utils:FreeKVCacheBlockQueue|FreeQueue",
+    "vllm.v1.kv_cache_interface:KVCacheConfig",
+    "vllm.v1.core.kv_cache_utils:get_kv_cache_groups",
+    "vllm.v1.core.kv_cache_manager:KVCacheManager",
+    "vllm.v1.core.kv_cache_coordinator:KVCacheCoordinator",
     "vllm.v1.core.block_pool:BlockPool",
     "vllm.v1.core.sched.scheduler:Scheduler",
-    "vllm.v1.worker.gpu_model_runner:GPUModelRunner",
+    "vllm.v1.engine.core:EngineCore",
+    "vllm.v1.worker.block_table:MultiGroupBlockTable",
 )
 
 

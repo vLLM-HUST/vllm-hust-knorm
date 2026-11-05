@@ -1,4 +1,44 @@
-# Host contract
+# Current host contract
+
+Public registration remains `import_only`. `VLLM_KNORM_ENABLED=1` is rejected;
+no serving or device qualification is implied by the development adapter.
+
+The candidate adapter is under `adapters/ascend/` and targets these complete
+upstream commits:
+
+- vLLM: `ced6857afa0ea7b2e3f0846a62e1394e90f15607`.
+- vLLM Ascend: `c09d3e20b9c45c80b34ae3781440d90904a44023`.
+
+Only dependency declarations are patched on disk. Explicit development
+configuration installs guarded, idempotent process-local wrappers for the
+planner, synchronous `EngineCore.step`, scheduler retirement, Ascend worker
+budget/RPC and V1 runner cache/metadata boundaries. The loader wraps the
+effective planner again after Ascend's platform patch module finishes loading.
+Disabled configurations delegate to their original functions.
+
+The candidate checks source hashes, effective function origins and signatures,
+resolved model/cache/parallel settings, and the negotiated `LBNHC` layout.
+It supports the Qwen2.5-14B geometry, FP16, eager V1 execution, synchronous
+single-rank scheduling, private pages and no prefix cache, speculative decoding,
+KV transfer, LoRA, sleep mode or microbatching. Sparse attention, automatic
+context-size fitting and manual block-count overrides are rejected. It uses one actual host BlockPool
+and one shared K/V backing for 48 independently owned layer groups.
+
+Import-only discovery checks module availability without importing a device
+runner. It is distinct from candidate eligibility, which additionally uses
+`adapters/ascend/source-lock.json` and method guards. The broad manifest host
+range describes discovery only.
+
+CPU tests exercise real core scheduler, engine-step, allocation, input-batch and
+block-table objects. Model execution and device synchronization are replaced at
+the explicit test boundary; Ascend runner import, attention kernels and native
+initialization require separate validation. See [reproduction instructions](host-patches/README.md).
+
+## Archived block-level contract
+
+The remainder records the former implementation and its historical evidence.
+These hooks and enable commands are not installed by the current public entry.
+
 
 本插件定位为 vLLM-HUST（vllm v1 核心）的进程内 KV-cache 压缩扩展，
 manifest 宿主标识为：

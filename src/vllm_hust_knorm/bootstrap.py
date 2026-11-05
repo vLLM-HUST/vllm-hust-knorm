@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-HUST project
 """Discovery hook: import-only registration in hosts, no-op elsewhere.
 
-No compression hooks are installed until a concrete host binding is verified.
+Candidate wrappers require a separate explicit development flag and source guards.
 """
 
 from __future__ import annotations
@@ -17,6 +17,13 @@ def register_plugins() -> list[str]:
     """Register Knorm in vLLM hosts; no-op elsewhere."""
     if detect_host() is None:
         return []
+
+    import os
+
+    if os.environ.get("VLLM_KNORM_CANDIDATE") == "1":
+        from .adapters.ascend.loading import install
+
+        install()
 
     from .core.activation import activate
 

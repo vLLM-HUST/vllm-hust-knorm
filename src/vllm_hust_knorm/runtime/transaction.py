@@ -86,6 +86,9 @@ class Transactions:
                 raise RuntimeError("scheduler layout mismatch")
         self.worker.quiesce(request.instance)
         if transaction.status in {"PLANNED", "APPLYING"}:
+            begin = getattr(self.cache, "begin", None)
+            if begin is not None:
+                begin(request, plan)
             transaction.status = "APPLYING"  # From here rollback is forbidden.
             for layer in plan.layers:
                 self.cache.move(layer.packing)
