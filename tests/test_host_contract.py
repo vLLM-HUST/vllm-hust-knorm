@@ -40,8 +40,10 @@ class TestInstallIdempotency:
             "block_pool_free_blocks_prepend",
             "spec_registration",
             "scheduler_score_routing",
+            "scheduler_block_table_sync",
             "runner_init",
             "runner_sample_tokens",
+            "runner_block_table_sync",
         ):
             assert info["patches"][key] is True, key
 
@@ -236,6 +238,75 @@ class TestSchedulerRouting:
 
         assert result == "host-result"
         assert drain_block_scores() == {}
+
+
+class TestBlockTableReplacement:
+    def test_eviction_replaces_all_groups_before_native_append(
+        self, fake_host, monkeypatch
+    ):
+        from vllm_hust_knorm.knorm.block_table_sync import (
+            FULL_REPLACEMENT_SENTINEL,
+            mark_block_table_dirty,
+        )
+
+        install_patches()
+        scheduler = fake_host["Scheduler"]()
+        scheduler.block_tables["r1"] = ([1, 0, 0, 5, 2], [10, 11])
+        mark_block_table_dirty("r1")
+
+        cached = scheduler._make_cached_request_data(["r1"], [([2], [11])])
+        assert cached.new_block_ids[0][0][0] == FULL_REPLACEMENT_SENTINEL
+
+        runner = fake_host["GPUModelRunner"](
+            cache_config=types.SimpleNamespace(enable_prefix_caching=False)
+        )
+        runner.requests["r1"] = types.SimpleNamespace(block_ids=([1, 2, 3, 5], [10]))
+        runner.input_batch.req_id_to_index["r1"] = 0
+        runner.input_batch.block_table.rows[0] = ([1, 2, 3, 5], [10])
+        output = types.SimpleNamespace(scheduled_cached_reqs=cached)
+
+        assert runner._update_states(output) == "states-updated"
+        assert runner.requests["r1"].block_ids == ([1, 0, 0, 5, 2], [10, 11])
+        assert runner.input_batch.block_table.rows[0] == (
+            [1, 0, 0, 5, 2],
+            [10, 11],
+        )
+        assert runner.input_batch.block_table.clear_calls == [0]
+
+    def test_ordinary_cached_update_remains_append_only(self, fake_host):
+        install_patches()
+        runner = fake_host["GPUModelRunner"]()
+        runner.requests["r1"] = types.SimpleNamespace(block_ids=([1, 2],))
+        runner.input_batch.req_id_to_index["r1"] = 0
+        runner.input_batch.block_table.rows[0] = ([1, 2],)
+        cached = types.SimpleNamespace(
+            req_ids=["r1"],
+            resumed_req_ids=set(),
+            new_block_ids=[([3],)],
+        )
+
+        runner._update_states(types.SimpleNamespace(scheduled_cached_reqs=cached))
+
+        assert runner.requests["r1"].block_ids == ([1, 2, 3],)
+        assert runner.input_batch.block_table.rows[0] == ([1, 2, 3],)
+        assert runner.input_batch.block_table.clear_calls == []
+
+    def test_malformed_or_mismatched_replacement_fails_closed(self, fake_host):
+        from vllm_hust_knorm.knorm.block_table_sync import (
+            FULL_REPLACEMENT_SENTINEL,
+        )
+
+        install_patches()
+        runner = fake_host["GPUModelRunner"]()
+        runner.requests["r1"] = types.SimpleNamespace(block_ids=([1], [2]))
+        cached = types.SimpleNamespace(
+            req_ids=["r1"],
+            resumed_req_ids=set(),
+            new_block_ids=[([FULL_REPLACEMENT_SENTINEL, 3],)],
+        )
+
+        with pytest.raises(RuntimeError, match="cache-group count"):
+            runner._update_states(types.SimpleNamespace(scheduled_cached_reqs=cached))
 
 
 class TestRunnerPatches:

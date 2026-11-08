@@ -11,9 +11,9 @@ manifest 宿主标识为：
 当前 ECPA manifest 状态为 `import_only`：下述宿主表面和历史真机证据供
 检查与后续资格验收使用，但 ECPA 会在 `enable` 之前明确拒绝激活，直到
 [issue #3](https://github.com/vLLM-HUST/vllm-hust-knorm/issues/3) 的
-scheduler/worker block-table replacement 正确性问题关闭并重新完成原生验收。
+scheduler/worker block-table replacement 修复在当前宿主上完成真机复验。
 
-## 宿主表面（六个幂等补丁的挂接点）
+## 宿主表面（八个幂等补丁的挂接点）
 
 插件经 `vllm.general_plugins` 在**每个进程**（process 0、engine core、
 worker）被加载，安装以下补丁（全部带 marker、可重入、默认惰性 ——
@@ -27,6 +27,14 @@ worker）被加载，安装以下补丁（全部带 marker、可重入、默认�
 | P4 | `vllm.v1.core.sched.scheduler.Scheduler.update_from_output` | 把 `model_runner_output.knorm_block_scores` 路由进 manager 分数桥 | legacy PR #76 |
 | P5 | `vllm.v1.worker.gpu_model_runner.GPUModelRunner.__init__` | 以 `should_activate()` 计算 `_knorm_active`（与 P3 同一真源，杜绝 legacy issue #163 的半启用态）；激活时在首个 forward 前安装注意力包装 | legacy PR #214 |
 | P6 | `vllm.v1.worker.gpu_model_runner.GPUModelRunner.sample_tokens` | forward 后收集逐块分数并附着到输出 | legacy PR #76/#214 |
+| P7 | `Scheduler._make_cached_request_data` | 对发生 KNorm 原位淘汰的请求，将 append-only delta 替换为带保留标记的完整多 cache-group block table | issue #3 correctness repair |
+| P8 | `GPUModelRunner._update_states` | 在原生 append 路径前消费标记、清空旧 worker state 与 device block-table row，再用完整表重建；普通 delta 不变 | issue #3 correctness repair |
+
+P7/P8 使用现有整数列表中的保留负值作为一次性 wire marker，因而不依赖
+动态 dataclass 属性，能够穿过 scheduler/worker 序列化边界。worker 在把
+payload 交回原生路径前必须移除 marker；marker 位置错误、重复、cache-group
+数量不一致、缺少 worker request state 或与 native resume 重叠都会 fail closed。
+请求结束、取消或 rollback 进入 manager `free()` 时会清除未消费的 dirty 状态。
 
 宿主 registry（`KVCacheSpecRegistry._ensure_registered`）以惰性 import
 解析 `register_all_kvcache_specs`。**真机教训（910B2，2026-09-18）**：
@@ -81,9 +89,9 @@ P1/P2 自动跳过（fix `15b1cc0`）。
   ECPA 注入激活环境；未来只有在资格门关闭后才可恢复该启动路径。
 - prefix caching 与 Knorm 互斥（PR #134）：开启时保持宿主原生
   manager 并 `warning_once`。
-- 异步调度（async scheduling）路径为尽力而为：分数附着在
-  `sample_tokens` 返回对象上，是否被宿主异步管线透传取决于宿主版本；
-  真机验收以同步调度为准。
+- 异步调度的 block-table replacement 使用 cached-request 既有 wire payload，
+  不依赖进程内共享状态；分数附着在 `sample_tokens` 返回对象上的上行透传仍
+  取决于宿主版本，当前真机资格仍需同步与异步两条路径分别复验。
 - 卸载后必须重启进程才能回退（进程内补丁不支持热卸载）。
 - **可观测性标记**（服务器验证依据，见 docs/how-to-run.md §5）：
   bootstrap 打 `runtime patches registered`；P3 成功重定向打
