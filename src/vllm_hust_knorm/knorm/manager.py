@@ -160,6 +160,13 @@ def get_knorm_manager_class() -> type:
             if removed_uncached:
                 self.block_pool.free_blocks(removed_uncached, prepend=True)
 
+            # Native cached-request updates are append-only.  Tell the
+            # scheduler wrapper to send the complete post-eviction table so
+            # every worker replaces stale positions before its next forward.
+            from .block_table_sync import mark_block_table_dirty
+
+            mark_block_table_dirty(request_id)
+
             # ── 4. Clean up score records for evicted indices ──
             if request_id in self._block_scores:
                 for index in decision.indices:
@@ -169,6 +176,9 @@ def get_knorm_manager_class() -> type:
             """Free blocks and clean up score records."""
             super().free(request_id)
             self._block_scores.pop(request_id, None)
+            from .block_table_sync import clear_block_table_dirty
+
+            clear_block_table_dirty(request_id)
 
     return KnormFullAttentionManager
 

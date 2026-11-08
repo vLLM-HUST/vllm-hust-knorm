@@ -11,8 +11,12 @@ CUDA hosts are untested.
 
 **Status: experimental, inspect-only (manifest `0.3-experimental`).** ECPA
 discovers the installed carrier and its exclusive KV-compression resource, but
-fails closed before activation while the scheduler/worker block-table
-replacement correctness gate in issue #3 remains open. Serving-level
+fails closed before activation while the repaired scheduler/worker block-table
+replacement path awaits current-host hardware requalification in issue #3.
+The carrier now sends a tagged, complete multi-group table after every KNorm
+eviction and makes the worker replace its stale host/device row before the
+native cached-request update continues; append-only updates remain unchanged.
+Serving-level
 integration passed end-to-end on a real Ascend 910B2 (2026-09-18, eager
 mode — see the verified-environment table below and
 [HOST_CONTRACT.md](HOST_CONTRACT.md)). Not yet verified: graph mode,
@@ -30,7 +34,7 @@ enabled.
 src/vllm_hust_knorm/
 ├── bootstrap.py            vllm.general_plugins 动态加载入口
 ├── core/                   宿主探测、守卫、统一激活管线
-├── knorm/                  config / norms / eviction（纯逻辑，CPU 可测）
+├── knorm/                  config / norms / eviction / block-table sync
 │   ├── attention_backend / hooks / manager（torch 与宿主路径，惰性导入）
 ├── adapters/vllm_hust/     六个幂等宿主补丁（见 HOST_CONTRACT.md）
 └── manifests/              vllm-hust-extension-v0.3.json

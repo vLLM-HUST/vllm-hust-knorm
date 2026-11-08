@@ -16,7 +16,9 @@ import importlib.util
 VLLM_HOST = "vllm"
 
 # Host surfaces the runtime patches bind to. Kept in one place so the
-# contract tests and HOST_CONTRACT.md stay in sync with the adapter.
+# contract tests and HOST_CONTRACT.md stay in sync with the adapter. Scheduler
+# and GPUModelRunner must expose the P7/P8 private methods checked at patch time;
+# a drifted host fails closed instead of silently losing replacements.
 # An "attr1|attr2" entry means any one of the alternatives satisfies
 # the contract (host generations renamed the free-block queue class).
 REQUIRED_SURFACES = (

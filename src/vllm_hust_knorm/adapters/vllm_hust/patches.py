@@ -24,6 +24,10 @@ P5  ``GPUModelRunner.__init__`` — compute ``_knorm_active`` from the
     before the first forward (PR #214 guards).
 P6  ``GPUModelRunner.sample_tokens`` — collect per-block scores after
     the forward and attach them to the runner output (PR #76/#214).
+P7  ``Scheduler._make_cached_request_data`` — replace append-only deltas
+    with a tagged full multi-group table after KNorm changes old positions.
+P8  ``GPUModelRunner._update_states`` — consume the replacement tag by
+    clearing the stale host/device row before the native update path runs.
 
 Every patch carries a marker and is a no-op on re-install. The patches
 are inert unless the environment activates Knorm
@@ -310,6 +314,33 @@ def _install_scheduler_score_routing(scheduler_cls: type) -> bool:
     return _wrap(scheduler_cls, "update_from_output", build)
 
 
+def _install_scheduler_block_table_sync(scheduler_cls: type) -> bool:
+    """P7: emit full block tables for requests mutated by KNorm."""
+    from ...knorm.block_table_sync import (
+        clear_block_table_dirty,
+        dirty_requests,
+        encode_full_replacement,
+    )
+
+    def build(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def _make_cached_request_data(self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(self, *args, **kwargs)
+            pending = dirty_requests(result.req_ids)
+            for index, request_id in enumerate(result.req_ids):
+                if request_id not in pending:
+                    continue
+                full_table = self.kv_cache_manager.get_block_ids(request_id)
+                result.new_block_ids[index] = encode_full_replacement(full_table)
+                # Consume only after a complete serializable payload exists.
+                clear_block_table_dirty(request_id)
+            return result
+
+        return _make_cached_request_data
+
+    return _wrap(scheduler_cls, "_make_cached_request_data", build)
+
+
 def _install_runner_init_patch(runner_cls: type) -> bool:
     """P5: compute ``_knorm_active`` once and install the wrapper early."""
 
@@ -377,6 +408,51 @@ def _install_runner_sample_patch(runner_cls: type) -> bool:
     return _wrap(runner_cls, "sample_tokens", build)
 
 
+def _install_runner_block_table_sync(runner_cls: type) -> bool:
+    """P8: turn tagged cached-request deltas into full replacements."""
+    from ...knorm.block_table_sync import decode_full_replacement
+
+    def build(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def _update_states(self: Any, scheduler_output: Any) -> Any:
+            request_data = scheduler_output.scheduled_cached_reqs
+            for index, request_id in enumerate(request_data.req_ids):
+                payload = request_data.new_block_ids[index]
+                if payload is None:
+                    continue
+                replace, clean_payload = decode_full_replacement(payload)
+                if not replace:
+                    continue
+                if request_id in request_data.resumed_req_ids:
+                    raise RuntimeError(
+                        "KNorm replacement unexpectedly overlaps native resume"
+                    )
+                request_state = self.requests.get(request_id)
+                if request_state is None:
+                    raise RuntimeError(
+                        f"KNorm replacement has no worker state for {request_id!r}"
+                    )
+                if len(request_state.block_ids) != len(clean_payload):
+                    raise RuntimeError(
+                        "KNorm replacement cache-group count differs between "
+                        "scheduler and worker"
+                    )
+
+                # Leave empty per-group lists so the native append path writes
+                # the complete payload into host state.  Clear the persistent
+                # device row first for already-batched requests.
+                request_state.block_ids = tuple([] for _ in clean_payload)
+                request_index = self.input_batch.req_id_to_index.get(request_id)
+                if request_index is not None:
+                    self.input_batch.block_table.clear_row(request_index)
+                request_data.new_block_ids[index] = clean_payload
+            return original(self, scheduler_output)
+
+        return _update_states
+
+    return _wrap(runner_cls, "_update_states", build)
+
+
 def install_patches() -> dict[str, Any]:
     """Install all host patches (idempotent) and report what happened.
 
@@ -402,8 +478,12 @@ def install_patches() -> dict[str, Any]:
         "scheduler_score_routing": _install_scheduler_score_routing(
             scheduler_module.Scheduler
         ),
+        "scheduler_block_table_sync": _install_scheduler_block_table_sync(
+            scheduler_module.Scheduler
+        ),
         "runner_init": _install_runner_init_patch(GPUModelRunner),
         "runner_sample_tokens": _install_runner_sample_patch(GPUModelRunner),
+        "runner_block_table_sync": _install_runner_block_table_sync(GPUModelRunner),
     }
     return {
         "patches": applied,

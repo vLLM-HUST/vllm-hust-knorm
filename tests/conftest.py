@@ -260,8 +260,21 @@ def build_fake_host() -> dict[str, Any]:
     sched_mod = register_module("vllm.v1.core.sched.scheduler")
 
     class Scheduler:
+        def __init__(self):
+            self.kv_cache_manager = types.SimpleNamespace(
+                get_block_ids=lambda request_id: self.block_tables[request_id]
+            )
+            self.block_tables: dict[str, tuple[list[int], ...]] = {}
+
         def update_from_output(self, scheduler_output, model_runner_output):
             return "host-result"
+
+        def _make_cached_request_data(self, req_ids, new_block_ids):
+            return types.SimpleNamespace(
+                req_ids=list(req_ids),
+                resumed_req_ids=set(),
+                new_block_ids=list(new_block_ids),
+            )
 
     sched_mod.Scheduler = Scheduler
     host["Scheduler"] = Scheduler
@@ -275,11 +288,47 @@ def build_fake_host() -> dict[str, Any]:
             self.input_batch = None
             self.kv_cache_config = None
             self.positions = None
+            self.requests = {}
+
+            class FakeBlockTable:
+                def __init__(self):
+                    self.rows = {}
+                    self.clear_calls = []
+
+                def clear_row(self, row_idx):
+                    current = self.rows.get(row_idx, ())
+                    self.rows[row_idx] = tuple([] for _ in current)
+                    self.clear_calls.append(row_idx)
+
+                def append_row(self, block_ids, row_idx):
+                    previous = self.rows.get(row_idx, tuple([] for _ in block_ids))
+                    self.rows[row_idx] = tuple(
+                        [*old, *new]
+                        for old, new in zip(previous, block_ids, strict=True)
+                    )
+
+            self.input_batch = types.SimpleNamespace(
+                req_id_to_index={}, block_table=FakeBlockTable()
+            )
 
         def sample_tokens(self, grammar_output=None):
             result = types.SimpleNamespace(sampled_token_ids=[1])
             self.last_grammar_output = grammar_output
             return result
+
+        def _update_states(self, scheduler_output):
+            data = scheduler_output.scheduled_cached_reqs
+            for index, request_id in enumerate(data.req_ids):
+                payload = data.new_block_ids[index]
+                if payload is None:
+                    continue
+                state = self.requests[request_id]
+                for old, new in zip(state.block_ids, payload, strict=True):
+                    old.extend(new)
+                row = self.input_batch.req_id_to_index.get(request_id)
+                if row is not None:
+                    self.input_batch.block_table.append_row(payload, row)
+            return "states-updated"
 
     runner_mod.GPUModelRunner = GPUModelRunner
     host["GPUModelRunner"] = GPUModelRunner
@@ -351,6 +400,9 @@ def fake_host(monkeypatch, clean_knorm_env):
     """Fresh fake host modules + pristine plugin globals per test."""
     from vllm_hust_knorm.core import activation
     from vllm_hust_knorm.knorm.attention_backend import reset_for_tests
+    from vllm_hust_knorm.knorm.block_table_sync import (
+        reset_for_tests as reset_block_table_sync,
+    )
     from vllm_hust_knorm.knorm.manager import (
         get_knorm_manager_class,
     )
@@ -369,6 +421,7 @@ def fake_host(monkeypatch, clean_knorm_env):
 
     reset_for_tests()
     reset_manager()
+    reset_block_table_sync()
     get_knorm_manager_class.cache_clear()
     activation.reset_for_tests()
 

@@ -205,7 +205,15 @@ class TestManagerAgainstFakeHost:
         assert head is original_blocks[3]
         assert pool.free_block_queue.num_free_blocks == 30
 
+        from vllm_hust_knorm.knorm.block_table_sync import dirty_requests
+
+        assert dirty_requests(["r1"]) == {"r1"}
+
     def test_manager_free_cleans_scores(self, fake_host):
+        from vllm_hust_knorm.knorm.block_table_sync import (
+            dirty_requests,
+            mark_block_table_dirty,
+        )
         from vllm_hust_knorm.knorm.manager import get_knorm_manager_class
 
         spec = fake_host["FullAttentionSpec"]()
@@ -213,8 +221,11 @@ class TestManagerAgainstFakeHost:
         manager = get_knorm_manager_class()(spec, block_pool=pool)
         manager._block_scores["r1"] = {0: 1.0}
         manager.req_to_blocks["r1"] = []
+        mark_block_table_dirty("r1")
+        assert dirty_requests(["r1"]) == {"r1"}
 
         manager.free("r1")
 
         assert "r1" not in manager._block_scores
         assert manager.freed_requests == ["r1"]
+        assert dirty_requests(["r1"]) == set()
