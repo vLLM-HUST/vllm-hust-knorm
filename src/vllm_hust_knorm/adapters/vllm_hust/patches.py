@@ -26,8 +26,9 @@ P6  ``GPUModelRunner.sample_tokens`` — collect per-block scores after
     the forward and attach them to the runner output (PR #76/#214).
 P7  ``Scheduler._make_cached_request_data`` — replace append-only deltas
     with a tagged full multi-group table after KNorm changes old positions.
-P8  ``GPUModelRunner._update_states`` — consume the replacement tag by
-    clearing the stale host/device row before the native update path runs.
+P8  ``GPUModelRunner._update_states`` / V2 ``update_requests`` — consume
+    the replacement tag by clearing or overwriting the stale host/device row
+    before the native update path runs.
 
 Every patch carries a marker and is a no-op on re-install. The patches
 are inert unless the environment activates Knorm
@@ -50,6 +51,21 @@ from ...knorm.config import (
 )
 
 _PATCHED = "_vllm_hust_knorm_patched"
+
+
+def _record_full_replacement(owner: Any, stage: str, block_ids: Any) -> None:
+    """Keep a bounded runtime receipt without exposing request identity."""
+    attribute = f"_knorm_full_replacements_{stage.replace('-', '_')}"
+    count = int(getattr(owner, attribute, 0)) + 1
+    setattr(owner, attribute, count)
+    if count == 1:
+        lengths = [len(group) for group in block_ids]
+        print(
+            "[vllm-hust-knorm] full block-table replacement "
+            f"{stage}; groups={len(lengths)} lengths={lengths} "
+            f"(log marker: knorm-replacement-{stage})",
+            flush=True,
+        )
 
 
 def _wrap(owner: Any, name: str, builder: Callable[[Callable[..., Any]], Any]) -> bool:
@@ -332,6 +348,7 @@ def _install_scheduler_block_table_sync(scheduler_cls: type) -> bool:
                     continue
                 full_table = self.kv_cache_manager.get_block_ids(request_id)
                 result.new_block_ids[index] = encode_full_replacement(full_table)
+                _record_full_replacement(self, "emitted", full_table)
                 # Consume only after a complete serializable payload exists.
                 clear_block_table_dirty(request_id)
             return result
@@ -397,7 +414,15 @@ def _install_runner_sample_patch(runner_cls: type) -> bool:
             if getattr(self, "_knorm_wrapper_installed", False) and (
                 _is_last_pp_rank()
             ):
-                collect_knorm_scores(self, self.input_batch)
+                input_batch = getattr(self, "input_batch", None)
+                if input_batch is None:
+                    execute_state = getattr(self, "execute_model_state", None)
+                    input_batch = getattr(execute_state, "input_batch", None)
+                if input_batch is None:
+                    raise RuntimeError(
+                        "KNorm cannot locate the model-runner input batch"
+                    )
+                collect_knorm_scores(self, input_batch)
             result = original(self, grammar_output)
             if getattr(self, "_knorm_wrapper_installed", False):
                 attach_knorm_scores(self, result)
@@ -446,11 +471,57 @@ def _install_runner_block_table_sync(runner_cls: type) -> bool:
                 if request_index is not None:
                     self.input_batch.block_table.clear_row(request_index)
                 request_data.new_block_ids[index] = clean_payload
+                _record_full_replacement(self, "applied-v1", clean_payload)
             return original(self, scheduler_output)
 
         return _update_states
 
     return _wrap(runner_cls, "_update_states", build)
+
+
+def _install_runner_block_table_sync_v2(runner_cls: type) -> bool:
+    """P8 for Model Runner V2's staged block-table writer."""
+    from ...knorm.block_table_sync import decode_full_replacement
+
+    def build(original: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(original)
+        def update_requests(self: Any, scheduler_output: Any) -> Any:
+            request_data = scheduler_output.scheduled_cached_reqs
+            for index, request_id in enumerate(request_data.req_ids):
+                payload = request_data.new_block_ids[index]
+                if payload is None:
+                    continue
+                replace, clean_payload = decode_full_replacement(payload)
+                if not replace:
+                    continue
+                if request_id in request_data.resumed_req_ids:
+                    raise RuntimeError(
+                        "KNorm replacement unexpectedly overlaps native resume"
+                    )
+                request_index = self.req_states.req_id_to_index.get(request_id)
+                if request_index is None:
+                    raise RuntimeError(
+                        f"KNorm replacement has no worker state for {request_id!r}"
+                    )
+                if len(clean_payload) != self.block_tables.num_kv_cache_groups:
+                    raise RuntimeError(
+                        "KNorm replacement cache-group count differs between "
+                        "scheduler and worker"
+                    )
+
+                # Stage a complete replacement and keep the native update path
+                # from appending the same payload a second time. execute_model
+                # applies the staged writes before the forward pass.
+                self.block_tables.append_block_ids(
+                    request_index, clean_payload, overwrite=True
+                )
+                request_data.new_block_ids[index] = None
+                _record_full_replacement(self, "applied-v2", clean_payload)
+            return original(self, scheduler_output)
+
+        return update_requests
+
+    return _wrap(runner_cls, "update_requests", build)
 
 
 def install_patches() -> dict[str, Any]:
@@ -465,6 +536,26 @@ def install_patches() -> dict[str, Any]:
     import vllm.v1.core.single_type_kv_cache_manager as stm_module
     import vllm.v1.kv_cache_spec_registry as registry_module
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    v2_runner_class: type | None = None
+    v2_sample_runner_classes: list[type] = []
+    try:
+        from vllm.v1.worker.gpu.model_runner import GPUModelRunner as GPUModelRunnerV2
+
+        v2_runner_class = GPUModelRunnerV2
+        v2_sample_runner_classes.append(GPUModelRunnerV2)
+    except ImportError:
+        # Older supported hosts have no Model Runner V2 package.
+        pass
+    try:
+        # Ascend overrides sample_tokens, so patch the concrete class in
+        # addition to the host base. The init and update_requests methods still
+        # delegate/inherit and remain idempotent under _wrap.
+        from vllm_ascend.worker.v2.model_runner import NPUModelRunner
+
+        v2_sample_runner_classes.append(NPUModelRunner)
+    except ImportError:
+        pass
 
     free_queue_cls = _resolve_free_queue_cls(kv_cache_utils_module)
     applied = {
@@ -484,7 +575,17 @@ def install_patches() -> dict[str, Any]:
         "runner_init": _install_runner_init_patch(GPUModelRunner),
         "runner_sample_tokens": _install_runner_sample_patch(GPUModelRunner),
         "runner_block_table_sync": _install_runner_block_table_sync(GPUModelRunner),
+        "runner_v2_init": False,
+        "runner_v2_sample_tokens": False,
+        "runner_v2_block_table_sync": False,
     }
+    if v2_runner_class is not None:
+        applied["runner_v2_init"] = _install_runner_init_patch(v2_runner_class)
+        applied["runner_v2_block_table_sync"] = _install_runner_block_table_sync_v2(
+            v2_runner_class
+        )
+    for runner_cls in v2_sample_runner_classes:
+        applied["runner_v2_sample_tokens"] |= _install_runner_sample_patch(runner_cls)
     return {
         "patches": applied,
         "already_installed": not any(applied.values()),

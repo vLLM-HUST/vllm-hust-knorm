@@ -16,6 +16,7 @@ package) stays side-effect free and CPU-safe, per the extension guide.
 from __future__ import annotations
 
 import functools
+import importlib
 from collections.abc import Callable
 from typing import Any
 
@@ -97,6 +98,30 @@ def _resolve_impl_cls() -> type:
             "(vllm.v1.attention.backends.registry), which is not "
             "importable in this process"
         ) from exc
+
+    # vllm-ascend registers its CUSTOM backend lazily when the concrete
+    # attention module is imported.  General plugins run earlier than model
+    # construction, so querying CUSTOM immediately would otherwise fall
+    # through to FLASH_ATTN and wrap a class that the NPU runner never uses.
+    # Import only on the live NPU platform; CUDA/CPU installations remain
+    # entirely independent of vllm-ascend.
+    try:
+        from vllm.platforms import current_platform
+
+        if getattr(current_platform, "device_type", None) == "npu":
+            ascend_attention = importlib.import_module(
+                "vllm_ascend.attention.attention_v1"
+            )
+            # Ascend selects its OOT backend through the platform selector,
+            # not through AttentionBackendEnum.CUSTOM.  Resolve the same
+            # concrete implementation directly after forcing the lazy module
+            # import, before consulting the native vLLM registry below.
+            return ascend_attention.AscendAttentionBackend.get_impl_cls()
+    except ImportError:
+        # A host without the optional platform package uses its native
+        # registry entry below.  A broken installed backend is deliberately
+        # not swallowed: only absence is an acceptable fallback condition.
+        pass
 
     try:
         backend_cls = AttentionBackendEnum.CUSTOM.get_class()
