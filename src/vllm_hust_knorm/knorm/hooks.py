@@ -83,18 +83,40 @@ def collect_knorm_scores(runner: Any, input_batch: Any) -> None:
         runner._knorm_scores = None
         return
 
+    num_reqs = input_batch.num_reqs
+    if hasattr(input_batch, "num_tokens_no_spec"):
+        # Model Runner V1 persistent input batch.
+        num_scheduled = input_batch.num_tokens_no_spec[:num_reqs]
+        positions = runner.positions
+    else:
+        # Model Runner V2 per-step input batch.
+        num_scheduled = input_batch.num_scheduled_tokens[:num_reqs]
+        positions = input_batch.positions
+    num_tokens = sum(int(value) for value in num_scheduled)
+
     import torch  # noqa: PLC0415 — deliberate lazy device dependency
 
-    # Stack norms from all layers and average. Shape: [num_tokens].
-    all_norms = torch.stack(norms_list).float().mean(dim=0)
-    clear_pending_norms()
+    # Ascend MRV2 may pad each attention layer independently. Average only
+    # the leading real-token region; requiring every layer to cover that
+    # region keeps scoring fail-closed while allowing different padding
+    # capacities (for example 2048 on most layers and 1024 on another).
+    undersized = [len(norms) for norms in norms_list if len(norms) < num_tokens]
+    try:
+        if undersized:
+            raise RuntimeError(
+                "KNorm attention scores do not cover all scheduled tokens: "
+                f"need {num_tokens}, got layer lengths {undersized}"
+            )
+        all_norms = (
+            torch.stack([norms[:num_tokens] for norms in norms_list])
+            .float()
+            .mean(dim=0)
+        )
+    finally:
+        clear_pending_norms()
 
     token_norms = all_norms.cpu().numpy()
-    num_tokens = len(token_norms)
-
-    num_reqs = input_batch.num_reqs
-    num_scheduled = input_batch.num_tokens_no_spec[:num_reqs]
-    positions_np = runner.positions[:num_tokens].cpu().numpy()
+    positions_np = positions[:num_tokens].cpu().numpy()
 
     block_size = runner.kv_cache_config.kv_cache_groups[0].kv_cache_spec.block_size
 

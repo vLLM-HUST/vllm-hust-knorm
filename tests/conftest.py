@@ -333,6 +333,54 @@ def build_fake_host() -> dict[str, Any]:
     runner_mod.GPUModelRunner = GPUModelRunner
     host["GPUModelRunner"] = GPUModelRunner
 
+    # --- vllm.v1.worker.gpu.model_runner (Model Runner V2) --------------
+    runner_v2_mod = register_module("vllm.v1.worker.gpu.model_runner")
+
+    class GPUModelRunnerV2:
+        def __init__(self, cache_config=None):
+            self.cache_config = cache_config
+            self.kv_cache_config = None
+            self.execute_model_state = None
+            self.req_states = types.SimpleNamespace(req_id_to_index={})
+
+            class FakeBlockTables:
+                def __init__(self):
+                    self.num_kv_cache_groups = 2
+                    self.rows = {}
+                    self.calls = []
+
+                def append_block_ids(self, req_index, block_ids, overwrite):
+                    self.calls.append((req_index, block_ids, overwrite))
+                    previous = self.rows.get(req_index, tuple([] for _ in block_ids))
+                    self.rows[req_index] = (
+                        tuple(list(group) for group in block_ids)
+                        if overwrite
+                        else tuple(
+                            [*old, *new]
+                            for old, new in zip(previous, block_ids, strict=True)
+                        )
+                    )
+
+            self.block_tables = FakeBlockTables()
+
+        def sample_tokens(self, grammar_output=None):
+            result = types.SimpleNamespace(sampled_token_ids=[1])
+            self.last_grammar_output = grammar_output
+            return result
+
+        def update_requests(self, scheduler_output):
+            data = scheduler_output.scheduled_cached_reqs
+            for index, request_id in enumerate(data.req_ids):
+                payload = data.new_block_ids[index]
+                if payload is None:
+                    continue
+                req_index = self.req_states.req_id_to_index[request_id]
+                self.block_tables.append_block_ids(req_index, payload, overwrite=False)
+            return "requests-updated"
+
+    runner_v2_mod.GPUModelRunner = GPUModelRunnerV2
+    host["GPUModelRunnerV2"] = GPUModelRunnerV2
+
     # --- vllm.v1.attention.backends.registry ----------------------------
     attn_registry = register_module("vllm.v1.attention.backends.registry")
 

@@ -44,6 +44,9 @@ class TestInstallIdempotency:
             "runner_init",
             "runner_sample_tokens",
             "runner_block_table_sync",
+            "runner_v2_init",
+            "runner_v2_sample_tokens",
+            "runner_v2_block_table_sync",
         ):
             assert info["patches"][key] is True, key
 
@@ -272,6 +275,8 @@ class TestBlockTableReplacement:
             [10, 11],
         )
         assert runner.input_batch.block_table.clear_calls == [0]
+        assert scheduler._knorm_full_replacements_emitted == 1
+        assert runner._knorm_full_replacements_applied_v1 == 1
 
     def test_ordinary_cached_update_remains_append_only(self, fake_host):
         install_patches()
@@ -290,6 +295,31 @@ class TestBlockTableReplacement:
         assert runner.requests["r1"].block_ids == ([1, 2, 3],)
         assert runner.input_batch.block_table.rows[0] == ([1, 2, 3],)
         assert runner.input_batch.block_table.clear_calls == []
+
+    def test_v2_eviction_overwrites_staged_block_table(self, fake_host):
+        from vllm_hust_knorm.knorm.block_table_sync import (
+            encode_full_replacement,
+        )
+
+        install_patches()
+        runner = fake_host["GPUModelRunnerV2"]()
+        runner.req_states.req_id_to_index["r1"] = 3
+        runner.block_tables.rows[3] = ([1, 2, 3, 5], [10])
+        cached = types.SimpleNamespace(
+            req_ids=["r1"],
+            resumed_req_ids=set(),
+            new_block_ids=[encode_full_replacement(([1, 0, 0, 5, 2], [10, 11]))],
+        )
+
+        result = runner.update_requests(
+            types.SimpleNamespace(scheduled_cached_reqs=cached)
+        )
+
+        assert result == "requests-updated"
+        assert runner.block_tables.rows[3] == ([1, 0, 0, 5, 2], [10, 11])
+        assert runner.block_tables.calls == [(3, ([1, 0, 0, 5, 2], [10, 11]), True)]
+        assert cached.new_block_ids == [None]
+        assert runner._knorm_full_replacements_applied_v2 == 1
 
     def test_malformed_or_mismatched_replacement_fails_closed(self, fake_host):
         from vllm_hust_knorm.knorm.block_table_sync import (
@@ -330,6 +360,35 @@ class TestRunnerPatches:
         assert attention_backend._original_forward is not None
         # Server-side verification relies on this rg-able log marker.
         assert "knorm-wrapper-installed" in capsys.readouterr().out
+
+    def test_npu_backend_is_registered_before_wrapper_resolution(
+        self, fake_host, monkeypatch
+    ):
+        from vllm_hust_knorm.knorm import attention_backend
+
+        platforms = types.ModuleType("vllm.platforms")
+        platforms.current_platform = types.SimpleNamespace(device_type="npu")
+        monkeypatch.setitem(sys.modules, "vllm.platforms", platforms)
+        imports = []
+
+        class AscendBackend:
+            @staticmethod
+            def get_impl_cls():
+                return fake_host["AttentionImpl"]
+
+        monkeypatch.setattr(
+            attention_backend.importlib,
+            "import_module",
+            lambda name: (
+                imports.append(name)
+                or types.SimpleNamespace(AscendAttentionBackend=AscendBackend)
+            ),
+        )
+
+        impl = attention_backend._resolve_impl_cls()
+
+        assert imports == ["vllm_ascend.attention.attention_v1"]
+        assert impl is fake_host["AttentionImpl"]
 
     def test_inactive_runner_installs_nothing(self, fake_host, monkeypatch):
         install_patches()
@@ -408,6 +467,37 @@ class TestRunnerPatches:
 
 
 class TestAttachHook:
+    def test_collect_trims_layer_specific_ascend_padding(self):
+        torch = pytest.importorskip("torch")
+        from vllm_hust_knorm.knorm.attention_backend import (
+            get_pending_norms,
+            store_layer_norms,
+        )
+        from vllm_hust_knorm.knorm.hooks import collect_knorm_scores
+
+        store_layer_norms(torch.tensor([1.0, 2.0, 3.0, 99.0]))
+        store_layer_norms(torch.tensor([3.0, 4.0, 5.0]))
+        runner = types.SimpleNamespace(
+            kv_cache_config=types.SimpleNamespace(
+                kv_cache_groups=[
+                    types.SimpleNamespace(
+                        kv_cache_spec=types.SimpleNamespace(block_size=2)
+                    )
+                ]
+            )
+        )
+        input_batch = types.SimpleNamespace(
+            num_reqs=1,
+            num_scheduled_tokens=[3],
+            positions=torch.arange(3),
+            req_ids=["r1"],
+        )
+
+        collect_knorm_scores(runner, input_batch)
+
+        assert runner._knorm_scores == {"r1": [(0, 2.0), (1, 4.0)]}
+        assert get_pending_norms() == []
+
     def test_attach_sets_attribute(self):
         from vllm_hust_knorm.knorm.hooks import attach_knorm_scores
 
