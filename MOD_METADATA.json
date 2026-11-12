@@ -20,8 +20,17 @@
   "mod_id": "knorm-migration",
   "repository": "vllm-hust-knorm",
   "responsibility": {
-    "advisor_status": "unknown",
-    "advisors": [],
+    "advisor_status": "declared",
+    "advisors": [
+      {
+        "name": "Yao Wan / 万瑶",
+        "relationship": "internal"
+      },
+      {
+        "name": "Shuhao Zhang / 张书豪",
+        "relationship": "internal"
+      }
+    ],
     "maintainers": [
       {
         "github": "kotoriqaq0",
